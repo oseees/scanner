@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Scanner</title>
+<script async src="https://docs.opencv.org/4.8.0/opencv.js"></script>
 <style>
 :root{
   --bg:#000; --surface:#1c1c1e; --surface-2:#2c2c2e; --surface-3:#3a3a3c;
@@ -204,25 +205,103 @@ function addPage(url){
   };
   img.src=url;
 }
-/* True quad detection: Sobel edges -> convex hull -> max-area quadrilateral */
+/* Detection engine: OpenCV (Canny + contours) when online, improved pure-JS fallback offline */
+window.cvReady=false;
+(function waitCv(){
+  let tries=0;
+  const t=setInterval(()=>{
+    tries++;
+    try{
+      if(window.cv&&window.cv.Mat&&window.cv.imread){window.cvReady=true;clearInterval(t);}
+      else if(tries>60)clearInterval(t);
+    }catch(e){ if(tries>60)clearInterval(t); }
+  },500);
+})();
 function detectQuad(img){
+  if(window.cvReady){
+    try{ const q=cvDetectQuad(img); if(q)return q; }catch(e){}
+  }
+  return fallbackDetectQuad(img);
+}
+/* OpenCV path: multi-threshold Canny, contour scoring like CamScanner */
+function cvDetectQuad(img){
+  const cv=window.cv;
+  const W=600,H=Math.max(100,Math.round(600*img.height/img.width));
+  const t=document.createElement('canvas');t.width=W;t.height=H;
+  t.getContext('2d').drawImage(img,0,0,W,H);
+  const src=cv.imread(t);
+  const gray=new cv.Mat(),blur=new cv.Mat(),edges=new cv.Mat(),dil=new cv.Mat();
+  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray,blur,new cv.Size(5,5),0);
+  // median-based thresholds + fixed fallbacks
+  const params=[[50,150],[75,225],[30,100]];
+  let best=null,bestScore=0;
+  const kernel=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(5,5));
+  for(const [lo,hi] of params){
+    cv.Canny(blur,edges,lo,hi);
+    cv.dilate(edges,dil,kernel);
+    const contours=new cv.MatVector(),hier=new cv.Mat();
+    cv.findContours(dil,contours,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+    for(let i=0;i<contours.size();i++){
+      const c=contours.get(i);
+      const area=cv.contourArea(c);
+      if(area<W*H*0.08||area>W*H*0.96){c.delete();continue;}
+      const peri=cv.arcLength(c,true);
+      const approx=new cv.Mat();
+      cv.approxPolyDP(c,approx,0.02*peri,true);
+      if(approx.rows===4&&cv.isContourConvex(approx)){
+        const p=[];
+        for(let r=0;r<4;r++)p.push({x:approx.data32S[r*2],y:approx.data32S[r*2+1]});
+        const ang=maxCosine(p);
+        if(ang<0.35){
+          const score=area*(1-ang);
+          if(score>bestScore){bestScore=score;best=p;}
+        }
+      }
+      approx.delete();c.delete();
+    }
+    contours.delete();hier.delete();
+    if(best&&bestScore>W*H*0.4)break; // confident enough
+  }
+  src.delete();gray.delete();blur.delete();edges.delete();dil.delete();kernel.delete();
+  if(!best)return null;
+  let q=orderPts(best);
+  const sx=img.width/W,sy=img.height/H;
+  const cx=q.reduce((a,p)=>a+p.x,0)/4, cy=q.reduce((a,p)=>a+p.y,0)/4;
+  q=q.map(p=>({x:Math.max(0,Math.min(img.width-1,(cx+(p.x-cx)*.99)*sx)),y:Math.max(0,Math.min(img.height-1,(cy+(p.y-cy)*.99)*sy))}));
+  return q;
+}
+function maxCosine(p){
+  const o=orderPts(p);
+  let m=0;
+  for(let i=0;i<4;i++){
+    const a=o[i],b=o[(i+1)%4],c=o[(i+2)%4];
+    const v1x=a.x-b.x,v1y=a.y-b.y,v2x=c.x-b.x,v2y=c.y-b.y;
+    const dot=v1x*v2x+v1y*v2y, n1=Math.hypot(v1x,v1y)||1, n2=Math.hypot(v2x,v2y)||1;
+    m=Math.max(m,Math.abs(dot/(n1*n2)));
+  }
+  return m;
+}
+/* Offline fallback: hysteresis edges -> connected components -> RDP quad per component */
+function fallbackDetectQuad(img){
   try{
-    const W=400,H=Math.max(100,Math.round(400*img.height/img.width));
+    const W=500,H=Math.max(100,Math.round(500*img.height/img.width));
     const t=document.createElement('canvas');t.width=W;t.height=H;
     const tc=t.getContext('2d',{willReadFrequently:true});
     tc.drawImage(img,0,0,W,H);
     const d=tc.getImageData(0,0,W,H),px=d.data;
     const gray=new Float32Array(W*H);
     for(let i=0;i<W*H;i++)gray[i]=px[i*4]*.299+px[i*4+1]*.587+px[i*4+2]*.114;
-    // 3x3 box blur
-    const bl=new Float32Array(W*H);
+    // separable 5x5 gaussian-ish blur
+    const tmp=new Float32Array(W*H), bl=new Float32Array(W*H);
+    const K=[1,4,6,4,1],KS=16;
     for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-      let s=0,n=0;
-      for(let ky=-1;ky<=1;ky++)for(let kx=-1;kx<=1;kx++){
-        const yy=y+ky,xx=x+kx;
-        if(yy>=0&&yy<H&&xx>=0&&xx<W){s+=gray[yy*W+xx];n++;}
-      }
-      bl[y*W+x]=s/n;
+      let s=0;for(let k=-2;k<=2;k++){const xx=Math.min(W-1,Math.max(0,x+k));s+=gray[y*W+xx]*K[k+2];}
+      tmp[y*W+x]=s/KS;
+    }
+    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+      let s=0;for(let k=-2;k<=2;k++){const yy=Math.min(H-1,Math.max(0,y+k));s+=tmp[yy*W+x]*K[k+2];}
+      bl[y*W+x]=s/KS;
     }
     const mag=new Float32Array(W*H);
     for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
@@ -232,26 +311,130 @@ function detectQuad(img){
       mag[i]=Math.abs(gx)+Math.abs(gy);
     }
     const sorted=Array.from(mag).sort((a,b)=>a-b);
-    const th=sorted[Math.floor(sorted.length*.90)]||40;
-    const epts=[];
-    for(let y=2;y<H-2;y++)for(let x=2;x<W-2;x++)if(mag[y*W+x]>th)epts.push([x,y]);
-    if(epts.length<200)return null;
-    const hull=convexHull(epts);
-    if(hull.length<4)return null;
-    const qi=maxQuad(hull);
-    if(!qi)return null;
-    let q=qi.map(i=>({x:hull[i][0],y:hull[i][1]}));
-    q=orderPts(q);
-    const area=polyArea(q);
-    if(area<W*H*.12)return null; // too small, probably not a document
+    const tHi=sorted[Math.floor(sorted.length*.93)]||40;
+    const tLo=tHi*0.4;
+    // hysteresis: strong edges + weak connected to strong
+    const strong=new Uint8Array(W*H), edge=new Uint8Array(W*H);
+    for(let i=0;i<W*H;i++)if(mag[i]>=tHi){strong[i]=1;edge[i]=1;}
+    let changed=true;
+    for(let pass=0;pass<3&&changed;pass++){
+      changed=false;
+      for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
+        const i=y*W+x;
+        if(!edge[i]&&mag[i]>=tLo){
+          if(strong[i-1]||strong[i+1]||strong[i-W]||strong[i+W]){edge[i]=1;strong[i]=1;changed=true;}
+        }
+      }
+    }
+    // morphological close 3x3 to join borders
+    const dil2=new Uint8Array(W*H);
+    for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
+      const i=y*W+x;
+      dil2[i]=(edge[i]||edge[i-1]||edge[i+1]||edge[i-W]||edge[i+W])?1:0;
+    }
+    const closed=new Uint8Array(W*H);
+    for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){
+      const i=y*W+x;
+      closed[i]=(dil2[i]&&dil2[i-1]&&dil2[i+1]&&dil2[i-W]&&dil2[i+W])?1:0;
+    }
+    // connected components (BFS), keep large ones
+    const seen=new Int32Array(W*H).fill(-1);
+    let best=null,bestScore=0;
+    let compId=0;
+    const stack=[];
+    for(let s=0;s<W*H;s++){
+      if(!closed[s]||seen[s]>=0)continue;
+      stack.length=0;stack.push(s);seen[s]=compId;
+      const pts=[];
+      let minX=W,maxX=0,minY=H,maxY=0;
+      while(stack.length){
+        const i=stack.pop();
+        const x=i%W,y=(i/W)|0;
+        pts.push([x,y]);
+        if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
+        if(x>0&&closed[i-1]&&seen[i-1]<0){seen[i-1]=compId;stack.push(i-1);}
+        if(x<W-1&&closed[i+1]&&seen[i+1]<0){seen[i+1]=compId;stack.push(i+1);}
+        if(y>0&&closed[i-W]&&seen[i-W]<0){seen[i-W]=compId;stack.push(i-W);}
+        if(y<H-1&&closed[i+W]&&seen[i+W]<0){seen[i+W]=compId;stack.push(i+W);}
+      }
+      compId++;
+      if(pts.length<800)continue;
+      const bw=maxX-minX,bh=maxY-minY;
+      if(bw<W*0.25||bh<H*0.25)continue;
+      if(bw* bh<W*H*0.08)continue;
+      const hull=convexHull(pts.length>4000?pts.filter((_,k)=>k%2===0):pts);
+      if(hull.length<4)continue;
+      const peri=polyPeri(hull);
+      // candidate quads: RDP simplification + max-area quad fit; score both
+      const cands=[];
+      const approx=rdpClosed(hull,Math.max(2,0.02*peri));
+      if(approx.length===4)cands.push(approx.map(p=>({x:p[0],y:p[1]})));
+      try{
+        const qi=maxQuad(hull);
+        if(qi)cands.push(qi.map(i=>({x:hull[i][0],y:hull[i][1]})));
+      }catch(e){}
+      for(const cand of cands){
+        const q=orderPts(cand);
+        const area=polyArea(q);
+        if(area<W*H*0.1)continue;
+        const ang=maxCosine(q);
+        if(ang>0.4)continue;
+        const score=area*(1-ang)*Math.min(1,pts.length/8000+0.3);
+        if(score>bestScore){bestScore=score;best=q;}
+      }
+    }
+    // global-hull fallback (old behaviour) if components failed
+    if(!best){
+      const epts=[];
+      for(let y=2;y<H-2;y+=1)for(let x=2;x<W-2;x+=1)if(strong[y*W+x])epts.push([x,y]);
+      if(epts.length>=200){
+        const hull=convexHull(epts.length>6000?epts.filter((_,k)=>k%2===0):epts);
+        if(hull.length>=4){
+          const qi=maxQuad(hull);
+          if(qi){
+            let q=orderPts(qi.map(i=>({x:hull[i][0],y:hull[i][1]})));
+            if(polyArea(q)>=W*H*0.12)best=q;
+          }
+        }
+      }
+    }
+    if(!best)return null;
     const sx=img.width/W,sy=img.height/H;
-    // small inward margin to avoid black border
-    const cx=q.reduce((a,p)=>a+p.x,0)/4, cy=q.reduce((a,p)=>a+p.y,0)/4;
-    q=q.map(p=>({x:(cx+(p.x-cx)*.985)*sx, y:(cy+(p.y-cy)*.985)*sy}));
-    // clamp
-    q=q.map(p=>({x:Math.max(0,Math.min(img.width-1,p.x)),y:Math.max(0,Math.min(img.height-1,p.y))}));
-    return q;
+    const cx=best.reduce((a,p)=>a+p.x,0)/4, cy=best.reduce((a,p)=>a+p.y,0)/4;
+    return best.map(p=>({x:Math.max(0,Math.min(img.width-1,(cx+(p.x-cx)*.985)*sx)),y:Math.max(0,Math.min(img.height-1,(cy+(p.y-cy)*.985)*sy))}));
   }catch(e){return null;}
+}
+function polyPeri(h){
+  let p=0;
+  for(let i=0;i<h.length;i++){const a=h[i],b=h[(i+1)%h.length];p+=Math.hypot(b[0]-a[0],b[1]-a[1]);}
+  return p;
+}
+/* Ramer-Douglas-Peucker for closed loops: returns simplified point list */
+function rdpClosed(pts,eps){
+  if(pts.length<=4)return pts.slice();
+  // open RDP on the loop cut at the furthest pair
+  const keep=new Uint8Array(pts.length);
+  keep[0]=1;
+  const stack=[[0,pts.length-1]];
+  const dist=(p,a,b)=>{
+    const dx=b[0]-a[0],dy=b[1]-a[1];
+    const L=Math.hypot(dx,dy)||1e-9;
+    return Math.abs((p[0]-a[0])*dy-(p[1]-a[1])*dx)/L;
+  };
+  while(stack.length){
+    const [s,e]=stack.pop();
+    let dmax=0,idx=-1;
+    for(let i=s+1;i<e;i++){
+      const d=dist(pts[i],pts[s],pts[e]);
+      if(d>dmax){dmax=d;idx=i;}
+    }
+    if(dmax>eps&&idx>0){keep[idx]=1;stack.push([s,idx],[idx,e]);}
+  }
+  // close the loop: also simplify wrap segment
+  keep[pts.length-1]=1;
+  const out=[];
+  for(let i=0;i<pts.length;i++)if(keep[i])out.push(pts[i]);
+  return out.length>=3?out:pts.slice(0,4);
 }
 function convexHull(pts){
   const p=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
