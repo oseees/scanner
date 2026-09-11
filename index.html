@@ -227,7 +227,7 @@ function liveDetect(srcCnv){
   const px=tc.getImageData(0,0,W,H).data;
   const g=new Float32Array(W*H);
   for(let i=0;i<W*H;i++)g[i]=px[i*4]*.299+px[i*4+1]*.587+px[i*4+2]*.114;
-  const cg=grayClose(g,W,H,3); // erase text so the outline sticks to the page
+  const cg=grayClose(g,W,H,2); // erase text but preserve small booklet borders
   const b=new Float32Array(W*H);
   for(let y=0;y<H;y++)for(let x=0;x<W;x++){
     let s=0,n=0;
@@ -243,17 +243,21 @@ function liveDetect(srcCnv){
     mag[i]=Math.abs(-b[i-W-1]-2*b[i-1]-b[i+W-1]+b[i-W+1]+2*b[i+1]+b[i+W+1])+Math.abs(-b[i-W-1]-2*b[i-W]-b[i-W+1]+b[i+W-1]+2*b[i+W]+b[i+W+1]);
   }
   const srt=Array.from(mag).sort((a,b2)=>a-b2);
-  const th=srt[(srt.length*0.9)|0]||40;
-  const pts=[];
-  for(let y=2;y<H-2;y++)for(let x=2;x<W-2;x++)if(mag[y*W+x]>th)pts.push([x,y]);
-  if(pts.length<150)return null;
-  const hull=convexHull(pts.length>2500?pts.filter((_,k)=>k%2===0):pts);
-  if(hull.length<4)return null;
-  const qi=maxQuad(hull);
-  if(!qi)return null;
-  const q=orderPts(qi.map(i=>({x:hull[i][0],y:hull[i][1]})));
-  if(polyArea(q)<W*H*0.1||maxCosine(q)>0.42)return null;
-  return {q,W,H};
+  // try strong edges first, then a more sensitive pass for small/low-contrast booklets
+  for(const frac of [0.90,0.80]){
+    const th=srt[(srt.length*frac)|0]||40;
+    const pts=[];
+    for(let y=2;y<H-2;y++)for(let x=2;x<W-2;x++)if(mag[y*W+x]>th)pts.push([x,y]);
+    if(pts.length<150)continue;
+    const hull=convexHull(pts.length>2500?pts.filter((_,k)=>k%2===0):pts);
+    if(hull.length<4)continue;
+    const qi=maxQuad(hull);
+    if(!qi)continue;
+    const q=orderPts(qi.map(i=>({x:hull[i][0],y:hull[i][1]})));
+    if(polyArea(q)<W*H*0.06||maxCosine(q)>0.50)continue;
+    return {q,W,H};
+  }
+  return null;
 }
 function drawOverlay(q,vw,vh,ghost){
   const r=$('vfWrap').getBoundingClientRect();
@@ -288,13 +292,13 @@ function liveTick(){
         const area=polyArea(q)/(vw*vh);
         if(!liveLock){
           // acquire: same quad twice in a row before trusting it
-          if(area>0.12&&area<0.92){
+          if(area>0.06&&area<0.95){
             if(liveChal&&quadDist(q,liveChal)<diag*0.06)liveChalN++;
             else{liveChal=q.map(p=>({x:p.x,y:p.y}));liveChalN=1;}
             if(liveChalN>=2){liveLock={q:liveChal,area};livePrev=liveChal.map(p=>({x:p.x,y:p.y}));liveStable=0;liveLost=0;liveChal=null;}
             show=q;
           } else {liveChal=null;liveChalN=0;}
-        } else if(area>0.08&&area<0.95&&quadDist(q,liveLock.q)<diag*0.10&&Math.abs(area-liveLock.area)/(liveLock.area+1e-6)<0.7){
+        } else if(area>0.05&&area<0.96&&quadDist(q,liveLock.q)<diag*0.10&&Math.abs(area-liveLock.area)/(liveLock.area+1e-6)<0.7){
           // tracking: update corner-by-corner, reject jumping corners
           const upd=liveLock.q.map((p,i)=>{
             const dd=Math.hypot(q[i].x-p.x,q[i].y-p.y);
