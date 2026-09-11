@@ -219,6 +219,106 @@ function sharpnessOf(cnv){
   for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const i=y*w+x;const l=4*g[i]-g[i-1]-g[i+1]-g[i-w]-g[i+w];v+=l*l;}
   return v/(w*h);
 }
+function grayOf(cnv,maxW){
+  const s=Math.min(1,maxW/cnv.width);
+  const W=Math.max(60,Math.round(cnv.width*s)), H=Math.max(60,Math.round(cnv.height*s));
+  const t=document.createElement('canvas');t.width=W;t.height=H;
+  const tc=t.getContext('2d',{willReadFrequently:true});
+  tc.drawImage(cnv,0,0,W,H);
+  const d=tc.getImageData(0,0,W,H).data;
+  const g=new Float32Array(W*H);
+  for(let i=0;i<W*H;i++)g[i]=d[i*4]*.299+d[i*4+1]*.587+d[i*4+2]*.114;
+  return {g,W,H,s};
+}
+function fitLine(pts){
+  // total-least-squares line via PCA; returns normalized ax+by=c
+  let mx=0,my=0;const n=pts.length;
+  for(const p of pts){mx+=p.x;my+=p.y;}
+  mx/=n;my/=n;
+  let sxx=0,sxy=0,syy=0;
+  for(const p of pts){const dx=p.x-mx,dy=p.y-my;sxx+=dx*dx;sxy+=dx*dy;syy+=dy*dy;}
+  const th=0.5*Math.atan2(2*sxy,sxx-syy);
+  const dx=Math.cos(th),dy=Math.sin(th);
+  return {a:-dy,b:dx,c:-dy*mx+dx*my};
+}
+function ixL(l1,l2){
+  const d=l1.a*l2.b-l2.a*l1.b;
+  if(Math.abs(d)<1e-9)return null;
+  return {x:(l1.c*l2.b-l2.c*l1.b)/d, y:(l1.a*l2.c-l2.a*l1.c)/d};
+}
+/* Corner snap: refit each quad edge to nearby image gradients, then intersect.
+   q must be in the same pixel coords as gray (W,H). Never throws outward. */
+function refineQuad(gray,W,H,q){
+  try{
+    if(!q||q.length!==4)return q;
+    const diag=Math.hypot(W,H);
+    const lines=[];
+    for(let e=0;e<4;e++){
+      const A=q[e],B=q[(e+1)%4];
+      const ex=B.x-A.x, ey=B.y-A.y;
+      const len=Math.hypot(ex,ey);
+      if(!(len>10))return q;
+      const nx=-ey/len, ny=ex/len;
+      const pts=[];
+      const n=Math.min(60,Math.max(14,Math.round(len/6)));
+      const R=Math.min(16,Math.max(6,Math.round(len*0.06)));
+      for(let i=0;i<n;i++){
+        const t=(i+0.5)/n;
+        const cx=A.x+ex*t, cy=A.y+ey*t;
+        let bO=0,bG=-1;
+        for(let o=-R;o<=R;o++){
+          const x0=Math.round(cx+nx*(o-1)), y0=Math.round(cy+ny*(o-1));
+          const x1=Math.round(cx+nx*(o+1)), y1=Math.round(cy+ny*(o+1));
+          if(x0<0||y0<0||x0>=W||y0>=H||x1<0||y1<0||x1>=W||y1>=H)continue;
+          const gv=Math.abs(gray[y1*W+x1]-gray[y0*W+x0]);
+          if(gv>bG){bG=gv;bO=o;}
+        }
+        if(bG>8)pts.push({x:cx+nx*bO,y:cy+ny*bO});
+      }
+      if(pts.length<6)return q;
+      lines.push(fitLine(pts));
+    }
+    const out=[];
+    for(let c=0;c<4;c++){
+      const p=ixL(lines[(c+3)%4],lines[c]);
+      if(!p)return q;
+      if(Math.hypot(p.x-q[c].x,p.y-q[c].y)>diag*0.08)return q; // safety: reject wild snaps
+      out.push(p);
+    }
+    return out;
+  }catch(e){return q;}
+}
+/* Snap a quad (in cnv pixel coords) to true edges. Returns original on any failure. */
+function snapQuadFromCanvas(cnv,q,maxW){
+  try{
+    if(!q||q.length!==4)return q;
+    const {g,W,H,s}=grayOf(cnv,maxW||500);
+    const r=refineQuad(g,W,H,q.map(p=>({x:p.x*s,y:p.y*s})));
+    return r.map(p=>({x:p.x/s,y:p.y/s}));
+  }catch(e){return q;}
+}
+/* Snap a quad (in img pixel coords) against the full-resolution image. */
+function snapQuadForImage(img,q,maxW){
+  try{
+    if(!q||q.length!==4||!img.width)return q;
+    const mw=maxW||1000;
+    const s=Math.min(1,mw/Math.max(img.width,img.height));
+    const t=document.createElement('canvas');
+    t.width=Math.max(60,Math.round(img.width*s));t.height=Math.max(60,Math.round(img.height*s));
+    t.getContext('2d').drawImage(img,0,0,t.width,t.height);
+    return snapQuadFromCanvas(t,q.map(p=>({x:p.x*s,y:p.y*s})),mw).map(p=>({x:p.x/s,y:p.y/s}));
+  }catch(e){return q;}
+}
+/* Live detection: full OpenCV engine on the preview frame when loaded, else fast JS. */
+function liveDetectOrCv(srcCnv){
+  if(typeof window!=='undefined'&&window.cvReady){
+    try{
+      const q=cvDetectQuad(srcCnv);
+      if(q&&q.length===4)return {q,W:srcCnv.width,H:srcCnv.height};
+    }catch(e){}
+  }
+  return liveDetect(srcCnv);
+}
 function liveDetect(srcCnv){
   const W=240,H=Math.max(60,Math.round(240*srcCnv.height/srcCnv.width));
   const t=document.createElement('canvas');t.width=W;t.height=H;
@@ -284,7 +384,7 @@ function liveTick(){
     if(vw){
       liveBuf.width=320;liveBuf.height=Math.max(80,Math.round(320*vh/vw));
       liveBuf.getContext('2d').drawImage(video,0,0,liveBuf.width,liveBuf.height);
-      const det=liveDetect(liveBuf);
+      const det=liveDetectOrCv(liveBuf);
       const diag=Math.hypot(vw,vh);
       let show=null, ghost=false, locked=false;
       if(det){
@@ -295,7 +395,14 @@ function liveTick(){
           if(area>0.06&&area<0.95){
             if(liveChal&&quadDist(q,liveChal)<diag*0.06)liveChalN++;
             else{liveChal=q.map(p=>({x:p.x,y:p.y}));liveChalN=1;}
-            if(liveChalN>=2){liveLock={q:liveChal,area};livePrev=liveChal.map(p=>({x:p.x,y:p.y}));liveStable=0;liveLost=0;liveChal=null;}
+            if(liveChalN>=2){
+              let L=liveChal;
+              try{
+                const sc=liveBuf.width/vw;
+                L=snapQuadFromCanvas(liveBuf,L.map(p=>({x:p.x*sc,y:p.y*sc})),320).map(p=>({x:p.x/sc,y:p.y/sc}));
+              }catch(e){}
+              liveLock={q:L,area};livePrev=L.map(p=>({x:p.x,y:p.y}));liveStable=0;liveLost=0;liveChal=null;
+            }
             show=q;
           } else {liveChal=null;liveChalN=0;}
         } else if(area>0.05&&area<0.96&&quadDist(q,liveLock.q)<diag*0.10&&Math.abs(area-liveLock.area)/(liveLock.area+1e-6)<0.7){
@@ -305,6 +412,10 @@ function liveTick(){
             return dd<diag*0.08?q[i]:p;
           });
           liveLock.q=smoothQuad(upd,liveLock.q);
+          try{
+            const sc=liveBuf.width/vw;
+            liveLock.q=snapQuadFromCanvas(liveBuf,liveLock.q.map(p=>({x:p.x*sc,y:p.y*sc})),320).map(p=>({x:p.x/sc,y:p.y/sc}));
+          }catch(e){}
           liveLock.area=area;liveLost=0;liveChal=null;liveChalN=0;
           const mv=quadDist(liveLock.q,livePrev||liveLock.q);
           livePrev=liveLock.q.map(p=>({x:p.x,y:p.y}));
@@ -393,6 +504,7 @@ function addPage(url){
     if($('autoCrop')&&$('autoCrop').checked){
       setStatus('Auto-cropping…');
       quad=detectQuad(img);
+      try{ quad=snapQuadForImage(img,quad)||quad; }catch(e){}
     }
     if(quad){
       try{
@@ -463,7 +575,8 @@ function upgradeUncropped(){
     pg.busy=true;
     const img=new Image();
     img.onload=()=>{
-      const q=detectQuad(img);
+      let q=detectQuad(img);
+      try{ q=snapQuadForImage(img,q)||q; }catch(e){}
       if(q){
         try{ pg.current=renderFromOrig(img,q,'doc',8,14); pg.quad=q; pg.auto=true; }catch(e){}
       }
@@ -915,7 +1028,8 @@ $('batchRedetect').onclick=()=>{
     setStatus('Detecting page '+i+' of '+pages.length+'…');
     const img=new Image();
     img.onload=()=>{
-      const q=detectQuad(img);
+      let q=detectQuad(img);
+      try{ q=snapQuadForImage(img,q)||q; }catch(e){}
       try{
         if(q){pg.quad=q;pg.current=renderFromOrig(img,q,batchFilter,d.b,d.c);pg.auto=true;}
         else {pg.current=renderFromOrig(img,null,batchFilter,d.b,d.c);}
@@ -1012,7 +1126,8 @@ function applyPreviewFilter(){
 /* auto-detect: true quad via detectQuad() */
 $('autoBtn').onclick=()=>{
   if(!srcImg)return;
-  const q=detectQuad(srcImg);
+  let q=detectQuad(srcImg);
+  try{ q=snapQuadForImage(srcImg,q)||q; }catch(e){}
   if(!q){alert('Could not find edges. Adjust corners manually.');return;}
   pts=q;
   pages[activeIdx].quad=q.map(p=>({x:p.x,y:p.y}));
