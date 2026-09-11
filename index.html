@@ -627,6 +627,166 @@ function detectQuad(img){
   }
   return fallbackDetectQuad(img);
 }
+/* Edge-support scoring: what fraction of a quad's perimeter sits on real image
+   edges. A true document border beats a bigger quad drawn through background
+   clutter (furniture edges, fabric patterns, shadows). px is any grayscale
+   array-like (Uint8/Float32) at W,H; q is in the same coords. */
+function quadSupport(px,W,H,q){
+  try{
+    if(!q||q.length!==4)return 0;
+    const mags=[];
+    for(let e=0;e<4;e++){
+      const A=q[e],B=q[(e+1)%4];
+      const ex=B.x-A.x,ey=B.y-A.y,len=Math.hypot(ex,ey);
+      if(!(len>4))return 0;
+      const nx=-ey/len,ny=ex/len,n=24;
+      for(let i=0;i<n;i++){
+        const t=(i+0.5)/n,cx=A.x+ex*t,cy=A.y+ey*t;
+        // widest step in a +-8px profile: catches soft or slightly
+        // displaced borders (weak page edge melting into fabric/shadow)
+        let bm=0;
+        for(let o=-8;o<=8;o+=2){
+          const x0=Math.round(cx+nx*(o-2)),y0=Math.round(cy+ny*(o-2));
+          const x1=Math.round(cx+nx*(o+2)),y1=Math.round(cy+ny*(o+2));
+          if(x0<0||y0<0||x0>=W||y0>=H||x1<0||y1<0||x1>=W||y1>=H)continue;
+          const m=Math.abs(px[y1*W+x1]-px[y0*W+x0]);
+          if(m>bm)bm=m;
+        }
+        mags.push(bm);
+      }
+    }
+    if(mags.length<40)return 0;
+    const srt=mags.slice().sort((a,b)=>a-b);
+    const th=Math.max(12,srt[(srt.length*0.9)|0]*0.4);
+    let hit=0;for(let i=0;i<mags.length;i++)if(mags[i]>=th)hit++;
+    return hit/mags.length;
+  }catch(e){return 0;}
+}
+function supportScore(areaFrac,sup){return areaFrac*(0.2+0.8*sup*sup);}
+/* Outside-vs-inside contrast: along each edge, compare a strip just outside
+   the quad with one just inside. A true page border has background outside
+   (strong difference); a text block or printed rule has paper on both sides
+   (~zero). Returns the weakest edge's contrast — a page needs all four sides. */
+function borderContrast(px,W,H,q){
+  try{
+    if(!q||q.length!==4)return 0;
+    let cx=0,cy=0;
+    for(const p of q){cx+=p.x;cy+=p.y;}
+    cx/=4;cy/=4;
+    let worst=1e9;
+    for(let e=0;e<4;e++){
+      const A=q[e],B=q[(e+1)%4];
+      const ex=B.x-A.x,ey=B.y-A.y,len=Math.hypot(ex,ey);
+      if(!(len>4))return 0;
+      let nx=-ey/len,ny=ex/len;
+      const mx=A.x+ex/2,my=A.y+ey/2;
+      if((mx+nx-cx)*nx+(my+ny-cy)*ny<0){nx=-nx;ny=-ny;} // +normal points outward
+      const out=[],inn=[];
+      for(let i=0;i<12;i++){
+        const t=(i+0.5)/12,px0=A.x+ex*t,py0=A.y+ey*t;
+        for(let o=4;o<=12;o+=4){
+          const xo=Math.round(px0+nx*o),yo=Math.round(py0+ny*o);
+          const xi=Math.round(px0-nx*o),yi=Math.round(py0-ny*o);
+          if(xo>=0&&yo>=0&&xo<W&&yo<H)out.push(px[yo*W+xo]);
+          if(xi>=0&&yi>=0&&xi<W&&yi<H)inn.push(px[yi*W+xi]);
+        }
+      }
+      if(out.length<10||inn.length<10)return 0;
+      out.sort((a,b)=>a-b);inn.sort((a,b)=>a-b);
+      const med=a=>a[a.length>>1];
+      const c=Math.abs(med(out)-med(inn));
+      if(c<worst)worst=c;
+    }
+    return worst;
+  }catch(e){return 0;}
+}
+function quadScore(areaFrac,sup,contrast,disc){
+  return areaFrac*(0.2+0.8*sup*sup)*(0.25+0.75*Math.min(1,contrast/30))*(disc||1);
+}
+/* Border-contact penalty: a page fully inside the frame has all corners
+   interior; quads borrowing furniture edges that run to the frame boundary
+   (laptop lids, table edges) get discounted. Full-bleed pages still pass via
+   the contour and full-frame paths. */
+function borderTouchPenalty(q,W,H){
+  try{
+    let n=0;
+    for(const p of q){
+      if(p.x<W*0.08||p.y<H*0.08||p.x>W*0.92||p.y>H*0.92)n++;
+    }
+    return Math.pow(0.65,n);
+  }catch(e){return 1;}
+}
+/* Line-based quad assembly: longest straight border segments rarely form one
+   closed contour (weak side, shadow crossing), but pairwise intersections of
+   well-separated horizontal/vertical lines recover the page. Scores every
+   combination by edge support, so furniture edges lose to the true outline. */
+function houghQuad(cv,base,W,H,rawGray){
+  const segs=[];
+  // two passes: clean strong lines, then faint borders (Hough voting
+  // accumulates long faint page edges that Canny alone can't threshold)
+  const passes=[[40,120,80,0.12],[15,45,50,0.08]];
+  for(const [lo,hi,thr,ml] of passes){
+    const edges=new cv.Mat(),lines=new cv.Mat();
+    cv.Canny(base,edges,lo,hi);
+    cv.HoughLinesP(edges,lines,1,Math.PI/180,thr,W*ml,30);
+    const n=lines.rows;
+    for(let i=0;i<n;i++){
+      const x1=lines.data32S[i*4],y1=lines.data32S[i*4+1],x2=lines.data32S[i*4+2],y2=lines.data32S[i*4+3];
+      const len=Math.hypot(x2-x1,y2-y1);
+      if(len<W*0.08)continue;
+      segs.push({x1,y1,x2,y2,len,ang:Math.atan2(y2-y1,x2-x1)*180/Math.PI});
+    }
+    lines.delete();edges.delete();
+  }
+  const isHor=s=>Math.abs(s.ang)<30||Math.abs(s.ang)>150;
+  // diversity filter: one longest segment per (angle x position) cell so a
+  // single laptop edge can't fill every slot
+  const dedup=list=>{
+    const cell=new Map();
+    for(const s of list){
+      const mx=(s.x1+s.x2)/2, my=(s.y1+s.y2)/2;
+      const key=Math.round(s.ang/10)+':'+Math.round(((isHor(s)?my:mx))/15);
+      const prev=cell.get(key);
+      if(!prev||s.len>prev.len)cell.set(key,s);
+    }
+    return [...cell.values()].sort((a,b)=>b.len-a.len);
+  };
+  const hor=dedup(segs.filter(isHor)).slice(0,16);
+  const ver=dedup(segs.filter(s=>!isHor(s)&&Math.abs(Math.abs(s.ang)-90)<35)).slice(0,16);
+  const line=s=>{
+    const dx=s.x2-s.x1, dy=s.y2-s.y1, L=Math.hypot(dx,dy)||1;
+    return {a:-dy/L,b:dx/L,c:(-dy*s.x1+dx*s.y1)/L};
+  };
+  const ix=(l1,l2)=>{
+    const d=l1.a*l2.b-l2.a*l1.b;
+    if(Math.abs(d)<1e-6)return null;
+    return {x:(l1.c*l2.b-l2.c*l1.b)/d, y:(l1.a*l2.c-l2.a*l1.c)/d};
+  };
+  let best=null,bs=-1,bsCon=0;
+  for(let i=0;i<hor.length;i++)for(let j=i+1;j<hor.length;j++){
+    const y1=(hor[i].y1+hor[i].y2)/2, y2=(hor[j].y1+hor[j].y2)/2;
+    if(Math.abs(y1-y2)<H*0.15)continue; // same border, skip
+    const top=y1<y2?hor[i]:hor[j], bot=y1<y2?hor[j]:hor[i];
+    for(let k=0;k<ver.length;k++)for(let l=k+1;l<ver.length;l++){
+      const x1=(ver[k].x1+ver[k].x2)/2, x2=(ver[l].x1+ver[l].x2)/2;
+      if(Math.abs(x1-x2)<W*0.15)continue;
+      const lft=x1<x2?ver[k]:ver[l], rgt=x1<x2?ver[l]:ver[k];
+      const TL=ix(line(top),line(lft)),TR=ix(line(top),line(rgt)),
+            BR=ix(line(bot),line(rgt)),BL=ix(line(bot),line(lft));
+      if(!TL||!TR||!BR||!BL)continue;
+      const q=[TL,TR,BR,BL];
+      if(q.some(p=>p.x<-W*0.05||p.x>W*1.05||p.y<-H*0.05||p.y>H*1.05))continue;
+      const a=polyArea(q);
+      if(a<W*H*0.05||a>W*H*0.96||maxCosine(q)>0.5)continue;
+      const sc=supportScore(a/(W*H),quadSupport(rawGray,W,H,q))*borderTouchPenalty(q,W,H);
+      if(sc>bs){bs=sc;best=q;bsCon=borderContrast(rawGray,W,H,q);}
+    }
+  }
+  // honesty gate: assembled lines around printed text have paper on both
+  // sides (~zero contrast); refuse them so the fallback path gets a turn
+  if(best&&bsCon<2.5)return null;
+  return best;
+}
 /* OpenCV path: multi-threshold Canny, contour scoring like CamScanner */
 function cvDetectQuad(img){
   const cv=window.cv;
@@ -642,7 +802,7 @@ function cvDetectQuad(img){
   let otsu=128;
   try{otsu=cv.threshold(blur,tmpOtsu,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU);}catch(e){}
   const params=[[otsu*0.5,otsu],[50,150],[75,225],[30,100]];
-  let best=null,bestScore=0;
+  const cands=[];
   const kernel=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(5,5));
   const tryPass=(lo,hi,closeIt,minArea)=>{
     cv.Canny(closed,edges,lo,hi);
@@ -661,11 +821,7 @@ function cvDetectQuad(img){
       if(approx.rows===4&&cv.isContourConvex(approx)){
         const p=[];
         for(let r=0;r<4;r++)p.push({x:approx.data32S[r*2],y:approx.data32S[r*2+1]});
-        const ang=maxCosine(p);
-        if(ang<0.6){
-          const score=area*(1-ang*0.5);
-          if(score>bestScore){bestScore=score;best=p;}
-        }
+        if(maxCosine(p)<0.6&&cands.length<60)cands.push({p,area});
       }
       approx.delete();c.delete();
     }
@@ -673,14 +829,20 @@ function cvDetectQuad(img){
   };
   for(const [lo,hi] of params){
     tryPass(lo,hi,false,0.08);
-    if(best&&bestScore>W*H*0.4)break; // confident enough
   }
-  if(!best)tryPass(20,80,true,0.05); // second chance: joined edges, smaller docs
-  if(!best){
-    try{ // last resort: straight border lines (handles pages filling the frame)
-      const hq=houghQuad(cv,closed,W,H);
-      if(hq)best=hq;
-    }catch(e){}
+  tryPass(20,80,true,0.05); // second chance: joined edges, smaller docs
+  try{ // line assembly on unclosed edges (weak side, shadow crossing)
+    const hq=houghQuad(cv,blur,W,H,gray.data);
+    if(hq)cands.push({p:hq,area:polyArea(hq),disc:0.7}); // assembled lines: less trusted than closed contours
+  }catch(e){}
+  // pick the candidate with the best area x edge-support trade-off (support on raw gray)
+  let best=null,bestScore=-1;
+  if(cands.length){
+    const px=gray.data;
+    for(const c of cands){
+      const sc=quadScore(c.area/(W*H),quadSupport(px,W,H,c.p),borderContrast(px,W,H,c.p),c.disc);
+      if(sc>bestScore){bestScore=sc;best=c.p;}
+    }
   }
   src.delete();gray.delete();blur.delete();closed.delete();closeK.delete();tmpOtsu.delete();edges.delete();dil.delete();kernel.delete();
   if(!best){
@@ -692,58 +854,6 @@ function cvDetectQuad(img){
   const sx=img.width/W,sy=img.height/H;
   const cx=q.reduce((a,p)=>a+p.x,0)/4, cy=q.reduce((a,p)=>a+p.y,0)/4;
   q=q.map(p=>({x:Math.max(0,Math.min(img.width-1,(cx+(p.x-cx)*.99)*sx)),y:Math.max(0,Math.min(img.height-1,(cy+(p.y-cy)*.99)*sy))}));
-  return q;
-}
-/* Hough border-line fallback: finds the 4 page edges as straight lines.
-   Works when the page fills the frame (contours touch the image border). */
-function houghQuad(cv,base,W,H){
-  const edges=new cv.Mat(),lines=new cv.Mat();
-  cv.Canny(base,edges,50,150);
-  cv.HoughLinesP(edges,lines,1,Math.PI/180,120,W*0.25,25);
-  const n=lines.rows;
-  if(n<4){edges.delete();lines.delete();return null;}
-  const segs=[];
-  for(let i=0;i<n;i++){
-    const x1=lines.data32S[i*4],y1=lines.data32S[i*4+1],x2=lines.data32S[i*4+2],y2=lines.data32S[i*4+3];
-    const len=Math.hypot(x2-x1,y2-y1);
-    if(len<W*0.15)continue;
-    segs.push({x1,y1,x2,y2,len,ang:Math.atan2(y2-y1,x2-x1)*180/Math.PI});
-  }
-  lines.delete();edges.delete();
-  const isHor=s=>Math.abs(s.ang)<35||Math.abs(s.ang)>145;
-  const hor=segs.filter(isHor), ver=segs.filter(s=>!isHor(s)&&Math.abs(Math.abs(s.ang)-90)<40);
-  // cluster each orientation into 2 borders by position; keep longest segment per border
-  const borders=list=>{
-    if(list.length<2)return null;
-    const pos=list.map(s=>({s,v:((isHor(s)?(s.y1+s.y2)/2/H:((s.x1+s.x2)/2/W)))}))
-      .sort((a,b)=>a.v-b.v);
-    let gap=0,at=0;
-    for(let i=1;i<pos.length;i++){const d=pos[i].v-pos[i-1].v;if(d>gap){gap=d;at=i;}}
-    if(gap<0.12)return null; // no clean split into two borders
-    const g1=pos.slice(0,at).map(o=>o.s), g2=pos.slice(at).map(o=>o.s);
-    const rep=g=>g.reduce((a,b)=>b.len>a.len?b:a);
-    return [rep(g1),rep(g2)];
-  };
-  const hb=borders(hor), vb=borders(ver);
-  if(!hb||!vb)return null;
-  const line=s=>{ // normalized ax+by=c
-    const dx=s.x2-s.x1, dy=s.y2-s.y1, L=Math.hypot(dx,dy)||1;
-    return {a:-dy/L,b:dx/L,c:(-dy*s.x1+dx*s.y1)/L};
-  };
-  const ix=(l1,l2)=>{
-    const d=l1.a*l2.b-l2.a*l1.b;
-    if(Math.abs(d)<1e-6)return null;
-    return {x:(l1.c*l2.b-l2.c*l1.b)/d, y:(l1.a*l2.c-l2.a*l1.c)/d};
-  };
-  const [top,bot]=hb[0].y1+hb[0].y2<hb[1].y1+hb[1].y2?hb:[hb[1],hb[0]];
-  const [lft,rgt]=vb[0].x1+vb[0].x2<vb[1].x1+vb[1].x2?vb:[vb[1],vb[0]];
-  const TL=ix(line(top),line(lft)),TR=ix(line(top),line(rgt)),
-        BR=ix(line(bot),line(rgt)),BL=ix(line(bot),line(lft));
-  if(!TL||!TR||!BR||!BL)return null;
-  const q=[TL,TR,BR,BL];
-  if(q.some(p=>p.x<-W*0.1||p.x>W*1.1||p.y<-H*0.1||p.y>H*1.1))return null;
-  const a=polyArea(q);
-  if(a<W*H*0.05||a>W*H*0.96||maxCosine(q)>0.45)return null;
   return q;
 }
 function maxCosine(p){
@@ -777,6 +887,75 @@ function grayClose(g,W,H,r){
     out[y*W+x]=mn;
   }
   return out;
+}
+/* Pure-JS line assembly (offline): Hough transform on the edge map, pair up
+   well-separated horizontal/vertical lines, score every combination by edge
+   support. Finds pages whose borders never form one closed contour. */
+function jsLineQuad(edge,W,H,grayPx){
+  try{
+    const NT=90, step=Math.PI/NT;
+    const diag=Math.hypot(W,H);
+    const NR=Math.ceil(diag/2)+1, mid=(NR-1)>>1;
+    const acc=new Float32Array(NT*NR);
+    for(let y=2;y<H-2;y+=2)for(let x=2;x<W-2;x+=2){
+      if(!edge[y*W+x])continue;
+      for(let t=0;t<NT;t+=2){
+        const ri=Math.round((x*Math.cos(t*step)+y*Math.sin(t*step))/2)+mid;
+        if(ri>=0&&ri<NR)acc[t*NR+ri]++;
+      }
+    }
+    const vTh=Math.max(8,W*0.06);
+    const peaks=[];
+    for(let t=0;t<NT;t+=2)for(let r=1;r<NR-1;r++){
+      const v=acc[t*NR+r];
+      if(v>vTh&&v>=acc[t*NR+r-1]&&v>=acc[t*NR+r+1])peaks.push({t,r,v});
+    }
+    peaks.sort((a,b)=>b.v-a.v);
+    const Hln=[], Vln=[];
+    const seenHs=[], seenVs=[];
+    for(const p of peaks){
+      if(Hln.length>=10&&Vln.length>=10)break;
+      const th=p.t*step, rho=(p.r-mid)*2;
+      const nx=Math.cos(th), ny=Math.sin(th);
+      const dang=(((p.t*2+90)%180)+180)%180; // line direction 0..180
+      const horiz=dang<30||dang>150;
+      const vert=!horiz&&Math.abs(dang-90)<35;
+      if(!horiz&&!vert)continue;
+      const seen=horiz?seenHs:seenVs;
+      let dup=false;
+      for(const s of seen){if(Math.abs(s.t-p.t)<=2&&Math.abs(s.r-p.r)<=3){dup=true;break;}}
+      if(dup)continue;
+      seen.push(p);
+      (horiz?Hln:Vln).push({nx,ny,c:rho});
+    }
+    const posH=L=>{const y=(L.c-L.nx*W/2)/(Math.abs(L.ny)<1e-6?1e-6:L.ny);return y;};
+    const posV=L=>{const x=(L.c-L.ny*H/2)/(Math.abs(L.nx)<1e-6?1e-6:L.nx);return x;};
+    const ix=(l1,l2)=>{
+      const d=l1.nx*l2.ny-l2.nx*l1.ny;
+      if(Math.abs(d)<1e-9)return null;
+      return {x:(l1.c*l2.ny-l2.c*l1.ny)/d, y:(l1.nx*l2.c-l2.nx*l1.c)/d};
+    };
+    let best=null,bs=-1;
+    for(let i=0;i<Hln.length;i++)for(let j=i+1;j<Hln.length;j++){
+      const y1=posH(Hln[i]), y2=posH(Hln[j]);
+      if(Math.abs(y1-y2)<H*0.15)continue;
+      const top=y1<y2?Hln[i]:Hln[j], bot=y1<y2?Hln[j]:Hln[i];
+      for(let k=0;k<Vln.length;k++)for(let l=k+1;l<Vln.length;l++){
+        const x1=posV(Vln[k]), x2=posV(Vln[l]);
+        if(Math.abs(x1-x2)<W*0.15)continue;
+        const lft=x1<x2?Vln[k]:Vln[l], rgt=x1<x2?Vln[l]:Vln[k];
+        const TL=ix(top,lft),TR=ix(top,rgt),BR=ix(bot,rgt),BL=ix(bot,lft);
+        if(!TL||!TR||!BR||!BL)continue;
+        const q=[TL,TR,BR,BL];
+        if(q.some(p=>p.x<-W*0.05||p.x>W*1.05||p.y<-H*0.05||p.y>H*1.05))continue;
+        const a=polyArea(q);
+        if(a<W*H*0.05||a>W*H*0.96||maxCosine(q)>0.5)continue;
+        const sc=supportScore(a/(W*H),quadSupport(grayPx,W,H,q))*borderTouchPenalty(q,W,H);
+        if(sc>bs){bs=sc;best=q;}
+      }
+    }
+    return best;
+  }catch(e){return null;}
 }
 /* Offline fallback: hysteresis edges -> connected components -> RDP quad per component */
 function fallbackDetectQuad(img){
@@ -832,9 +1011,11 @@ function fallbackDetectQuad(img){
       const i=y*W+x;
       closed[i]=(dil2[i]&&dil2[i-1]&&dil2[i+1]&&dil2[i-W]&&dil2[i+W])?1:0;
     }
-    // connected components (BFS), keep large ones
+    // connected components (BFS), keep large ones; all gate-passing quads are
+    // collected and rescored by edge support at the end
     const seen=new Int32Array(W*H).fill(-1);
-    let best=null,bestScore=0;
+    let best=null;
+    const allCands=[];
     let compId=0;
     const stack=[];
     for(let s=0;s<W*H;s++){
@@ -874,13 +1055,11 @@ function fallbackDetectQuad(img){
         if(area<W*H*0.1)continue;
         const ang=maxCosine(q);
         if(ang>0.4)continue;
-        // Bias strongly towards larger document area (CamScanner prioritizes the document over inner tables)
-        const score = Math.pow(area, 1.5) * (1 - ang * 0.4) * Math.min(1, pts.length / 4000 + 0.3);
-        if(score>bestScore){bestScore=score;best=q;}
+        if(allCands.length<60)allCands.push({q,area});
       }
     }
     // global-hull fallback (old behaviour) if components failed
-    if(!best){
+    if(!allCands.length){
       const epts=[];
       for(let y=2;y<H-2;y+=1)for(let x=2;x<W-2;x+=1)if(strong[y*W+x])epts.push([x,y]);
       if(epts.length>=200){
@@ -889,9 +1068,21 @@ function fallbackDetectQuad(img){
           const qi=maxQuad(hull);
           if(qi){
             let q=orderPts(qi.map(i=>({x:hull[i][0],y:hull[i][1]})));
-            if(polyArea(q)>=W*H*0.12)best=q;
+            if(polyArea(q)>=W*H*0.12)allCands.push({q,area:polyArea(q)});
           }
         }
+      }
+    }
+    // pick the candidate with the best area x edge-support trade-off
+    try{ // line assembly on unclosed edges (weak side, shadow crossing)
+      const jq=jsLineQuad(strong,W,H,bl);
+      if(jq)allCands.push({q:jq,area:polyArea(jq),disc:0.7});
+    }catch(e){}
+    if(allCands.length){
+      let bs=-1;
+      for(const c of allCands){
+        const sc=quadScore(c.area/(W*H),quadSupport(bl,W,H,c.q),borderContrast(bl,W,H,c.q),c.disc);
+        if(sc>bs){bs=sc;best=c.q;}
       }
     }
     if(!best){
