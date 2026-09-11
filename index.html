@@ -247,11 +247,17 @@ function ixL(l1,l2){
   return {x:(l1.c*l2.b-l2.c*l1.b)/d, y:(l1.a*l2.c-l2.a*l1.c)/d};
 }
 /* Corner snap: refit each quad edge to nearby image gradients, then intersect.
+   Robust per edge: dominant transition polarity + deterministic RANSAC consensus,
+   so a straight text/table rule near the foot can't drag the border.
    q must be in the same pixel coords as gray (W,H). Never throws outward. */
 function refineQuad(gray,W,H,q){
   try{
     if(!q||q.length!==4)return q;
     const diag=Math.hypot(W,H);
+    const lineFromPts=(A,B)=>{
+      const dx=B.x-A.x, dy=B.y-A.y, L=Math.hypot(dx,dy)||1;
+      return {a:-dy/L,b:dx/L,c:(-dy*A.x+dx*A.y)/L};
+    };
     const lines=[];
     for(let e=0;e<4;e++){
       const A=q[e],B=q[(e+1)%4];
@@ -265,18 +271,46 @@ function refineQuad(gray,W,H,q){
       for(let i=0;i<n;i++){
         const t=(i+0.5)/n;
         const cx=A.x+ex*t, cy=A.y+ey*t;
-        let bO=0,bG=-1;
+        let bO=0,bG=-1,bS=0;
         for(let o=-R;o<=R;o++){
           const x0=Math.round(cx+nx*(o-1)), y0=Math.round(cy+ny*(o-1));
           const x1=Math.round(cx+nx*(o+1)), y1=Math.round(cy+ny*(o+1));
           if(x0<0||y0<0||x0>=W||y0>=H||x1<0||y1<0||x1>=W||y1>=H)continue;
-          const gv=Math.abs(gray[y1*W+x1]-gray[y0*W+x0]);
-          if(gv>bG){bG=gv;bO=o;}
+          const sd=gray[y1*W+x1]-gray[y0*W+x0]; // signed transition along +normal
+          const gv=Math.abs(sd);
+          if(gv>bG){bG=gv;bO=o;bS=sd<0?-1:1;}
         }
-        if(bG>8)pts.push({x:cx+nx*bO,y:cy+ny*bO});
+        if(bG>8)pts.push({x:cx+nx*bO,y:cy+ny*bO,s:bS});
       }
       if(pts.length<6)return q;
-      lines.push(fitLine(pts));
+      // dominant polarity: a true page border keeps one transition sign along its length
+      let pos=0;for(const p of pts)if(p.s>0)pos++;
+      const domSign=pos>=pts.length/2?1:-1;
+      const domCount=domSign>0?pos:pts.length-pos;
+      const cand=domCount>=pts.length*0.6?pts.filter(p=>p.s===domSign):pts;
+      // deterministic RANSAC: largest straight consensus wins (full-length border
+      // beats a shorter interior rule); fixed pairs so the lock doesn't shimmer
+      const band=Math.max(1.5,len*0.004);
+      let bestIn=null;
+      for(let it=0;it<40;it++){
+        const i1=(it*13)%cand.length;
+        let i2=(it*13+(cand.length>>1)+it*7)%cand.length;
+        if(i2===i1)i2=(i2+1)%cand.length;
+        const L0=lineFromPts(cand[i1],cand[i2]);
+        const inl=cand.filter(p=>Math.abs(L0.a*p.x+L0.b*p.y-L0.c)<=band);
+        if(!bestIn||inl.length>bestIn.length)bestIn=inl;
+        if(bestIn.length>=cand.length*0.9)break;
+      }
+      let line;
+      if(bestIn&&bestIn.length>=8&&bestIn.length>=cand.length*0.35){
+        line=fitLine(bestIn);
+      }else{
+        line=fitLine(cand);
+      }
+      // angle guard: fitted edge must stay near the detected direction
+      const orig=lineFromPts(A,B);
+      const dot=Math.abs(orig.a*line.a+orig.b*line.b);
+      lines.push(dot<Math.cos(15*Math.PI/180)?orig:line);
     }
     const out=[];
     for(let c=0;c<4;c++){
