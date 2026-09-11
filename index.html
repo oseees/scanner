@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Scanner</title>
-<script async src="https://docs.opencv.org/4.8.0/opencv.js"></script>
+<script async src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.3/dist/opencv.js"></script>
 <style>
 :root{
   --bg:#000; --surface:#1c1c1e; --surface-2:#2c2c2e; --surface-3:#3a3a3c;
@@ -406,17 +406,42 @@ function addPage(url){
   };
   img.src=url;
 }
+/* Single place that turns any image-ish source into raw RGBA pixels.
+   Keeps both engines identical between browser and tests. */
+function sampleImage(img,W,H){
+  const t=document.createElement('canvas');t.width=W;t.height=H;
+  const tc=t.getContext('2d',{willReadFrequently:true});
+  tc.drawImage(img,0,0,W,H);
+  const d=tc.getImageData(0,0,W,H);
+  // copy: the canvas may be reused/GC'd, the mat needs a stable buffer
+  const buf=new Uint8ClampedArray(d.data.length);
+  buf.set(d.data);
+  return {data:buf,width:d.width||W,height:d.height||H};
+}
 /* Detection engine: OpenCV (Canny + contours) when online, improved pure-JS fallback offline */
 window.cvReady=false;
+function onCvLoaded(){
+  if(window.cvReady)return;
+  window.cvReady=true;
+  try{$('engineBadge').textContent='PRO · PRIVATE';}catch(e){}
+  setTimeout(upgradeUncropped,500);
+}
+if(window.cv&&window.cv.Mat&&window.cv.matFromImageData){
+  onCvLoaded();
+} else if(window.cv){
+  window.cv.onRuntimeInitialized = onCvLoaded;
+}
 (function waitCv(){
   let tries=0;
   const t=setInterval(()=>{
     tries++;
     try{
-      if(window.cv&&window.cv.Mat&&window.cv.imread){
-        window.cvReady=true;clearInterval(t);
-        try{$('engineBadge').textContent='PRO · PRIVATE';}catch(e){}
-        setTimeout(upgradeUncropped,500); // re-run strong detection on early captures
+      if(window.cv&&window.cv.Mat&&window.cv.matFromImageData){
+        clearInterval(t);
+        onCvLoaded();
+      }
+      else if(window.cv&&!window.cv.onRuntimeInitialized){
+        window.cv.onRuntimeInitialized = onCvLoaded;
       }
       else if(tries>60)clearInterval(t);
     }catch(e){ if(tries>60)clearInterval(t); }
@@ -455,9 +480,7 @@ function detectQuad(img){
 function cvDetectQuad(img){
   const cv=window.cv;
   const W=600,H=Math.max(100,Math.round(600*img.height/img.width));
-  const t=document.createElement('canvas');t.width=W;t.height=H;
-  t.getContext('2d').drawImage(img,0,0,W,H);
-  const src=cv.imread(t);
+  const src=cv.matFromImageData(sampleImage(img,W,H));
   const gray=new cv.Mat(),blur=new cv.Mat(),closed=new cv.Mat(),edges=new cv.Mat(),dil=new cv.Mat(),tmpOtsu=new cv.Mat();
   cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
   cv.GaussianBlur(gray,blur,new cv.Size(5,5),0);
@@ -488,8 +511,8 @@ function cvDetectQuad(img){
         const p=[];
         for(let r=0;r<4;r++)p.push({x:approx.data32S[r*2],y:approx.data32S[r*2+1]});
         const ang=maxCosine(p);
-        if(ang<0.4){
-          const score=area*(1-ang);
+        if(ang<0.6){
+          const score=area*(1-ang*0.5);
           if(score>bestScore){bestScore=score;best=p;}
         }
       }
@@ -509,7 +532,11 @@ function cvDetectQuad(img){
     }catch(e){}
   }
   src.delete();gray.delete();blur.delete();closed.delete();closeK.delete();tmpOtsu.delete();edges.delete();dil.delete();kernel.delete();
-  if(!best)return null;
+  if(!best){
+    // If OpenCV could not find a contour/lines (e.g. low contrast white-on-white),
+    // let fallbackDetectQuad try its connected component analysis before giving up
+    return null;
+  }
   let q=orderPts(best);
   const sx=img.width/W,sy=img.height/H;
   const cx=q.reduce((a,p)=>a+p.x,0)/4, cy=q.reduce((a,p)=>a+p.y,0)/4;
@@ -604,10 +631,7 @@ function grayClose(g,W,H,r){
 function fallbackDetectQuad(img){
   try{
     const W=500,H=Math.max(100,Math.round(500*img.height/img.width));
-    const t=document.createElement('canvas');t.width=W;t.height=H;
-    const tc=t.getContext('2d',{willReadFrequently:true});
-    tc.drawImage(img,0,0,W,H);
-    const d=tc.getImageData(0,0,W,H),px=d.data;
+    const px=sampleImage(img,W,H).data;
     const gray=new Float32Array(W*H);
     for(let i=0;i<W*H;i++)gray[i]=px[i*4]*.299+px[i*4+1]*.587+px[i*4+2]*.114;
     // erase text first so the page becomes one blob (then blur)
@@ -699,7 +723,8 @@ function fallbackDetectQuad(img){
         if(area<W*H*0.1)continue;
         const ang=maxCosine(q);
         if(ang>0.4)continue;
-        const score=area*(1-ang)*Math.min(1,pts.length/8000+0.3);
+        // Bias strongly towards larger document area (CamScanner prioritizes the document over inner tables)
+        const score = Math.pow(area, 1.5) * (1 - ang * 0.4) * Math.min(1, pts.length / 4000 + 0.3);
         if(score>bestScore){bestScore=score;best=q;}
       }
     }
@@ -716,6 +741,17 @@ function fallbackDetectQuad(img){
             if(polyArea(q)>=W*H*0.12)best=q;
           }
         }
+      }
+    }
+    if(!best){
+      // Full frame fallback if document content fills the frame
+      let sum = 0, sqSum = 0;
+      for(let i=0; i<W*H; i++){ sum += gray[i]; sqSum += gray[i]*gray[i]; }
+      const mean = sum / (W * H);
+      const variance = (sqSum / (W * H)) - (mean * mean);
+      if(variance > 200){
+        // Inward margin should not be applied to edge bounds
+        return [{x: 0, y: 0}, {x: img.width - 1, y: 0}, {x: img.width - 1, y: img.height - 1}, {x: 0, y: img.height - 1}];
       }
     }
     if(!best)return null;
@@ -916,52 +952,52 @@ $('moveR').onclick=()=>{if(activeIdx<pages.length-1){const t=pages[activeIdx+1];
 $('delPage').onclick=()=>{if(activeIdx>=0){pages.splice(activeIdx,1);if(activeIdx>=pages.length)activeIdx=pages.length-1;renderPages();loadEditor();}};
 $('clearAll').onclick=()=>{if(confirm('Delete all pages?')){pages=[];activeIdx=-1;renderPages();loadEditor();}};
 
-const cv=$('editCanvas'), ctx=cv.getContext('2d');
+const editCv=$('editCanvas'), editCtx=editCv.getContext('2d');
 let dragIdx=-1;
 function toCanvas(p){
-  const r=cv.getBoundingClientRect();
-  return {x:p.x/cv.width*r.width, y:p.y/cv.height*r.height};
+  const r=editCv.getBoundingClientRect();
+  return {x:p.x/editCv.width*r.width, y:p.y/editCv.height*r.height};
 }
 function toImg(cx,cy){
-  const r=cv.getBoundingClientRect();
-  return {x:cx/r.width*cv.width, y:cy/r.height*cv.height};
+  const r=editCv.getBoundingClientRect();
+  return {x:cx/r.width*editCv.width, y:cy/r.height*editCv.height};
 }
 function evPos(e){
-  const r=cv.getBoundingClientRect();
+  const r=editCv.getBoundingClientRect();
   const t=e.touches?e.touches[0]:e;
-  return {x:(t.clientX-r.left)/r.width*cv.width, y:(t.clientY-r.top)/r.height*cv.height};
+  return {x:(t.clientX-r.left)/r.width*editCv.width, y:(t.clientY-r.top)/r.height*editCv.height};
 }
-cv.addEventListener('pointerdown',e=>{ if(!srcImg)return; const p=evPos(e);
+editCv.addEventListener('pointerdown',e=>{ if(!srcImg)return; const p=evPos(e);
   dragIdx=-1; let best=1e9;
   pts.forEach((q,i)=>{const d=(p.x-q.x)**2+(p.y-q.y)**2;if(d<best){best=d;dragIdx=i;}});
-  const thresh=(cv.width*0.06)**2;
+  const thresh=(editCv.width*0.06)**2;
   if(best>thresh)dragIdx=-1;
-  cv.setPointerCapture(e.pointerId);
+  editCv.setPointerCapture(e.pointerId);
 });
-cv.addEventListener('pointermove',e=>{ if(dragIdx>=0&&srcImg){const p=evPos(e);
-  pts[dragIdx].x=Math.max(0,Math.min(cv.width,p.x));
-  pts[dragIdx].y=Math.max(0,Math.min(cv.height,p.y));
+editCv.addEventListener('pointermove',e=>{ if(dragIdx>=0&&srcImg){const p=evPos(e);
+  pts[dragIdx].x=Math.max(0,Math.min(editCv.width,p.x));
+  pts[dragIdx].y=Math.max(0,Math.min(editCv.height,p.y));
   drawEditor();}});
-cv.addEventListener('pointerup',()=>dragIdx=-1);
+editCv.addEventListener('pointerup',()=>dragIdx=-1);
 
-function drawEmpty(){cv.width=600;cv.height=400;ctx.fillStyle='#111';ctx.fillRect(0,0,600,400);ctx.fillStyle='#666';ctx.font='14px system-ui';ctx.textAlign='center';ctx.fillText('Select a page to edit',300,200);}
+function drawEmpty(){editCv.width=600;editCv.height=400;editCtx.fillStyle='#111';editCtx.fillRect(0,0,600,400);editCtx.fillStyle='#666';editCtx.font='14px system-ui';editCtx.textAlign='center';editCtx.fillText('Select a page to edit',300,200);}
 function drawEditor(){
   if(!srcImg){drawEmpty();return;}
   // canvas matches rotated source aspect
   let sw=srcImg.width,sh=srcImg.height;
   const rot=rotation%360, swap=rot===90||rot===270;
-  cv.width=swap?sh:sw; cv.height=swap?sw:sh;
-  ctx.save();
-  ctx.translate(cv.width/2,cv.height/2);ctx.rotate(rot*Math.PI/180);
-  ctx.drawImage(srcImg,-sw/2,-sh/2,sw,sh);
-  ctx.restore();
+  editCv.width=swap?sh:sw; editCv.height=swap?sw:sh;
+  editCtx.save();
+  editCtx.translate(editCv.width/2,editCv.height/2);editCtx.rotate(rot*Math.PI/180);
+  editCtx.drawImage(srcImg,-sw/2,-sh/2,sw,sh);
+  editCtx.restore();
   // map stored pts (in unrotated coords) -> draw rotated overlay approx: keep simple, store in canvas coords after rotation
   if(pts.length===4&&(pts[0].x>sw||pts[0].y>sh)){resetPts();}
   // overlay polygon
-  ctx.strokeStyle='#0a84ff';ctx.lineWidth=Math.max(2,cv.width*0.004);
-  ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.closePath();ctx.stroke();
-  ctx.fillStyle='rgba(10,132,255,.12)';ctx.fill();
-  pts.forEach(p=>{ctx.beginPath();ctx.arc(p.x,p.y,Math.max(10,cv.width*0.02),0,7);ctx.fillStyle='#0a84ff';ctx.fill();ctx.lineWidth=3;ctx.strokeStyle='#fff';ctx.stroke();});
+  editCtx.strokeStyle='#0a84ff';editCtx.lineWidth=Math.max(2,editCv.width*0.004);
+  editCtx.beginPath();pts.forEach((p,i)=>i?editCtx.lineTo(p.x,p.y):editCtx.moveTo(p.x,p.y));editCtx.closePath();editCtx.stroke();
+  editCtx.fillStyle='rgba(10,132,255,.12)';editCtx.fill();
+  pts.forEach(p=>{editCtx.beginPath();editCtx.arc(p.x,p.y,Math.max(10,editCv.width*0.02),0,7);editCtx.fillStyle='#0a84ff';editCtx.fill();editCtx.lineWidth=3;editCtx.strokeStyle='#fff';editCtx.stroke();});
   applyPreviewFilter();
 }
 function applyPreviewFilter(){
@@ -1132,7 +1168,7 @@ $('applyBtn').onclick=()=>{
   const rot=rotation%360,swap=rot===90||rot===270;
   const rc=document.createElement('canvas');
   // use canvas coords (cv dims) mapping: pts stored in cv coords; draw fresh rotated image
-  rc.width=cv.width;rc.height=cv.height;
+  rc.width=editCv.width;rc.height=editCv.height;
   const rx=rc.getContext('2d');
   rx.save();rx.translate(rc.width/2,rc.height/2);rx.rotate(rot*Math.PI/180);
   rx.drawImage(srcImg,-sw/2,-sh/2,sw,sh);rx.restore();
