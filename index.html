@@ -23,7 +23,7 @@ header p{font-size:13px;color:var(--ink-2);margin-top:2px}
 .card{margin:12px 16px;background:var(--surface);border-radius:var(--radius-lg);padding:16px}
 .card h2{font-size:15px;font-weight:600;margin-bottom:4px}
 .card p.sub{font-size:12px;color:var(--ink-2);margin-bottom:12px}
-video#cam{width:100%;border-radius:12px;background:#000;aspect-ratio:4/3;object-fit:cover}
+video#cam{width:100%;height:auto;border-radius:12px;background:#000;object-fit:contain;min-height:280px;max-height:68vh;display:block}
 .row{display:flex;gap:8px}
 .btn{flex:1;border:none;border-radius:12px;padding:13px 10px;font-size:15px;font-weight:600;cursor:pointer;color:#fff;background:var(--surface-3)}
 .btn.primary{background:var(--blue)}
@@ -62,6 +62,7 @@ footer .btn{padding:14px 8px}
   <h2>1. Capture</h2>
   <p class="sub">Use the camera or import photos / files. Add one page at a time.</p>
   <video id="cam" playsinline muted autoplay></video>
+  <label class="slider" id="zoomRow" style="display:none">Zoom<input type="range" id="zoom" min="1" max="1" step="0.1" value="1"></label>
   <div class="row" style="margin-top:10px">
     <button class="btn primary" id="startCam">Start camera</button>
     <button class="btn" id="snap">Capture</button>
@@ -138,10 +139,22 @@ let srcImg=null, pts=null, rotation=0, filter='color', bright=0, contrast=0;
 
 /* ---------- camera ---------- */
 $('startCam').onclick=async()=>{
-  try{ stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false}); video.srcObject=stream; }
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:3840},height:{ideal:2160}},audio:false});
+    video.srcObject=stream;
+    // zoom control when the device supports it
+    try{
+      const track=stream.getVideoTracks()[0], caps=track.getCapabilities?track.getCapabilities():{};
+      if(caps.zoom){const z=$('zoom');z.min=caps.zoom.min;z.max=caps.zoom.max;z.step=caps.zoom.step||0.1;z.value=track.getSettings().zoom||caps.zoom.min;$('zoomRow').style.display='block';}
+      else $('zoomRow').style.display='none';
+    }catch(e){}
+  }
   catch(e){ alert('Camera blocked. Use Import photos instead, or open this file over https/localhost.'); }
 };
-$('stopCam').onclick=()=>{ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;} };
+$('zoom').oninput=e=>{
+  try{stream.getVideoTracks()[0].applyConstraints({advanced:[{zoom:+e.target.value}]});}catch(err){}
+};
+$('stopCam').onclick=()=>{ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;} $('zoomRow').style.display='none'; };
 function captureFrame(){
   let v=video, w=v.videoWidth, h=v.videoHeight;
   if(!w){ alert('Start the camera first, or import a photo.'); return; }
