@@ -72,6 +72,10 @@ footer .btn{padding:14px 8px}
     <button class="btn small" id="stopCam">Stop camera</button>
   </div>
   <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--ink-2);cursor:pointer"><input type="checkbox" id="autoCrop" checked style="width:18px;height:18px;accent-color:var(--green)"> Auto-crop documents on capture</label>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;color:var(--ink-2);cursor:pointer"><input type="checkbox" id="autoEnhance" checked style="width:18px;height:18px;accent-color:var(--green)"> Auto-enhance (Doc cleanup + sharpen)</label>
+  <div class="row" style="margin-top:8px">
+    <button class="btn small" id="rapidBtn">Rapid capture: off</button>
+  </div>
   <div id="scanStatus" style="font-size:12px;color:var(--ink-2);margin-top:6px"></div>
   <input type="file" id="fileInput" accept="image/*" multiple>
 </div>
@@ -92,7 +96,8 @@ footer .btn{padding:14px 8px}
     <button class="btn small" id="applyBtn">Apply crop + filter</button>
   </div>
   <div class="seg" id="filterSeg">
-    <button data-f="color" class="on">Color</button>
+    <button data-f="doc" class="on">Doc</button>
+    <button data-f="color">Color</button>
     <button data-f="gray">Gray</button>
     <button data-f="bw">B&amp;W</button>
     <button data-f="sharp">Sharp</button>
@@ -112,7 +117,33 @@ footer .btn{padding:14px 8px}
 </div>
 
 <div class="card">
-  <h2>4. Export</h2>
+  <h2>4. Batch</h2>
+  <p class="sub">One look for every page, then export a standard PDF.</p>
+  <div class="seg" id="batchSeg">
+    <button data-f="doc" class="on">Doc</button>
+    <button data-f="color">Color</button>
+    <button data-f="gray">Gray</button>
+    <button data-f="bw">B&amp;W</button>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="btn small primary" id="batchEnhance">Enhance all</button>
+    <button class="btn small" id="batchRedetect">Re-detect all</button>
+  </div>
+  <div class="seg" id="paperSeg">
+    <button data-p="orig" class="on">Original</button>
+    <button data-p="a4">A4</button>
+    <button data-p="letter">Letter</button>
+  </div>
+  <div class="seg" id="orientSeg" style="margin-top:8px">
+    <button data-o="auto" class="on">Auto orient</button>
+    <button data-o="portrait">Portrait</button>
+    <button data-o="landscape">Landscape</button>
+  </div>
+  <label class="slider">File name<input type="text" id="fileName" value="scan" maxlength="60" style="width:100%;margin-top:6px;background:var(--surface-2);border:1px solid var(--separator);color:#fff;border-radius:10px;padding:10px;font-size:15px"></label>
+</div>
+
+<div class="card">
+  <h2>5. Export</h2>
   <p class="sub">PDF keeps every page in order. JPG saves the selected page.</p>
   <div class="row">
     <button class="btn green" id="expPdf">Save PDF</button>
@@ -154,7 +185,16 @@ $('startCam').onclick=async()=>{
 $('zoom').oninput=e=>{
   try{stream.getVideoTracks()[0].applyConstraints({advanced:[{zoom:+e.target.value}]});}catch(err){}
 };
-$('stopCam').onclick=()=>{ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;} $('zoomRow').style.display='none'; };
+$('stopCam').onclick=()=>{ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;} $('zoomRow').style.display='none'; stopRapid(); };
+let rapidTimer=null;
+function stopRapid(){ if(rapidTimer){clearInterval(rapidTimer);rapidTimer=null;$('rapidBtn').textContent='Rapid capture: off';} }
+$('rapidBtn').onclick=()=>{
+  if(rapidTimer){stopRapid();return;}
+  if(!video.videoWidth){alert('Start the camera first.');return;}
+  let n=0;
+  $('rapidBtn').textContent='Rapid capture: on (tap to stop)';
+  rapidTimer=setInterval(()=>{captureFrame();n++;$('rapidBtn').textContent='Rapid capture: on ('+n+') — tap to stop';},2500);
+};
 function captureFrame(){
   let v=video, w=v.videoWidth, h=v.videoHeight;
   if(!w){ alert('Start the camera first, or import a photo.'); return; }
@@ -197,15 +237,8 @@ function addPage(url){
     }
     if(quad){
       try{
-        const rc=document.createElement('canvas');rc.width=img.width;rc.height=img.height;
-        rc.getContext('2d').drawImage(img,0,0);
-        const wTop=Math.hypot(quad[1].x-quad[0].x,quad[1].y-quad[0].y),wBot=Math.hypot(quad[2].x-quad[3].x,quad[2].y-quad[3].y);
-        const hL=Math.hypot(quad[3].x-quad[0].x,quad[3].y-quad[0].y),hR=Math.hypot(quad[2].x-quad[1].x,quad[2].y-quad[1].y);
-        const outW=Math.max(200,Math.round(Math.max(wTop,wBot))),outH=Math.max(200,Math.round(Math.max(hL,hR)));
-        const prevF=filter, prevB=bright, prevC=contrast;
-        filter='sharp';bright=8;contrast=12;
-        const cropped=enhance(warp(rc,quad,outW,outH)).toDataURL('image/jpeg',.92);
-        filter=prevF;bright=prevB;contrast=prevC;
+        const enh=$('autoEnhance')&&$('autoEnhance').checked;
+        const cropped=renderFromOrig(img,quad,enh?'doc':'color',enh?8:0,enh?14:0);
         pages.push({orig:url, current:cropped, quad:quad, auto:true});
         auto=true;
       }catch(e){ pages.push({orig:url, current:url, quad:null, auto:false}); }
@@ -225,11 +258,37 @@ window.cvReady=false;
   const t=setInterval(()=>{
     tries++;
     try{
-      if(window.cv&&window.cv.Mat&&window.cv.imread){window.cvReady=true;clearInterval(t);}
+      if(window.cv&&window.cv.Mat&&window.cv.imread){
+        window.cvReady=true;clearInterval(t);
+        setTimeout(upgradeUncropped,500); // re-run strong detection on early captures
+      }
       else if(tries>60)clearInterval(t);
     }catch(e){ if(tries>60)clearInterval(t); }
   },500);
 })();
+let upgrading=false;
+function upgradeUncropped(){
+  if(upgrading||!pages.some(p=>!p.auto))return;
+  upgrading=true;setStatus('Scan engine loaded. Re-cropping early pages…');
+  let i=0;
+  const step=()=>{
+    if(i>=pages.length){upgrading=false;renderPages();loadEditor();setStatus('Re-crop done.');return;}
+    const pg=pages[i++];
+    if(pg.auto||pg.busy){step();return;}
+    pg.busy=true;
+    const img=new Image();
+    img.onload=()=>{
+      const q=detectQuad(img);
+      if(q){
+        try{ pg.current=renderFromOrig(img,q,'doc',8,14); pg.quad=q; pg.auto=true; }catch(e){}
+      }
+      pg.busy=false;step();
+    };
+    img.onerror=()=>{pg.busy=false;step();};
+    img.src=pg.orig;
+  };
+  step();
+}
 function detectQuad(img){
   if(window.cvReady){
     try{ const q=cvDetectQuad(img); if(q)return q; }catch(e){}
@@ -250,23 +309,25 @@ function cvDetectQuad(img){
   const params=[[50,150],[75,225],[30,100]];
   let best=null,bestScore=0;
   const kernel=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(5,5));
-  for(const [lo,hi] of params){
+  const tryPass=(lo,hi,closeIt,minArea)=>{
     cv.Canny(blur,edges,lo,hi);
-    cv.dilate(edges,dil,kernel);
+    if(closeIt){cv.dilate(edges,dil,kernel);cv.erode(dil,edges,kernel);cv.dilate(edges,dil,kernel);}
+    else cv.dilate(edges,dil,kernel);
     const contours=new cv.MatVector(),hier=new cv.Mat();
     cv.findContours(dil,contours,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
     for(let i=0;i<contours.size();i++){
       const c=contours.get(i);
       const area=cv.contourArea(c);
-      if(area<W*H*0.08||area>W*H*0.96){c.delete();continue;}
+      if(area<W*H*minArea||area>W*H*0.96){c.delete();continue;}
       const peri=cv.arcLength(c,true);
+      if(peri<40){c.delete();continue;}
       const approx=new cv.Mat();
       cv.approxPolyDP(c,approx,0.02*peri,true);
       if(approx.rows===4&&cv.isContourConvex(approx)){
         const p=[];
         for(let r=0;r<4;r++)p.push({x:approx.data32S[r*2],y:approx.data32S[r*2+1]});
         const ang=maxCosine(p);
-        if(ang<0.35){
+        if(ang<0.4){
           const score=area*(1-ang);
           if(score>bestScore){bestScore=score;best=p;}
         }
@@ -274,8 +335,12 @@ function cvDetectQuad(img){
       approx.delete();c.delete();
     }
     contours.delete();hier.delete();
+  };
+  for(const [lo,hi] of params){
+    tryPass(lo,hi,false,0.08);
     if(best&&bestScore>W*H*0.4)break; // confident enough
   }
+  if(!best)tryPass(20,80,true,0.05); // second chance: joined edges, smaller docs
   src.delete();gray.delete();blur.delete();edges.delete();dil.delete();kernel.delete();
   if(!best)return null;
   let q=orderPts(best);
@@ -513,11 +578,78 @@ function renderPages(){
   });
 }
 
+/* Rebuild a page from its original: warp to quad (or full frame) + enhance with explicit settings */
+function renderFromOrig(img,quad,f,b,c){
+  const prevF=filter, prevB=bright, prevC=contrast;
+  filter=f;bright=b;contrast=c;
+  try{
+    let base;
+    if(quad){
+      const rc=document.createElement('canvas');rc.width=img.width;rc.height=img.height;
+      rc.getContext('2d').drawImage(img,0,0);
+      const wTop=Math.hypot(quad[1].x-quad[0].x,quad[1].y-quad[0].y),wBot=Math.hypot(quad[2].x-quad[3].x,quad[2].y-quad[3].y);
+      const hL=Math.hypot(quad[3].x-quad[0].x,quad[3].y-quad[0].y),hR=Math.hypot(quad[2].x-quad[1].x,quad[2].y-quad[1].y);
+      base=warp(rc,quad,Math.max(200,Math.round(Math.max(wTop,wBot))),Math.max(200,Math.round(Math.max(hL,hR))));
+    } else {
+      base=document.createElement('canvas');base.width=img.width;base.height=img.height;
+      base.getContext('2d').drawImage(img,0,0);
+    }
+    return enhance(base).toDataURL('image/jpeg',.92);
+  }finally{ filter=prevF;bright=prevB;contrast=prevC; }
+}
+/* ---------- batch: one look for all pages ---------- */
+let batchFilter='doc', paper='orig', orient='auto';
+document.querySelectorAll('#batchSeg button').forEach(b=>b.onclick=()=>{batchFilter=b.dataset.f;document.querySelectorAll('#batchSeg button').forEach(x=>x.classList.toggle('on',x===b));});
+document.querySelectorAll('#paperSeg button').forEach(b=>b.onclick=()=>{paper=b.dataset.p;document.querySelectorAll('#paperSeg button').forEach(x=>x.classList.toggle('on',x===b));});
+document.querySelectorAll('#orientSeg button').forEach(b=>b.onclick=()=>{orient=b.dataset.o;document.querySelectorAll('#orientSeg button').forEach(x=>x.classList.toggle('on',x===b));});
+function batchDefaults(){
+  // Doc cleanup wants a lift; plain filters stay neutral
+  return batchFilter==='doc'?{b:8,c:14}:(batchFilter==='bw'?{b:0,c:18}:{b:0,c:0});
+}
+$('batchEnhance').onclick=()=>{
+  if(!pages.length){alert('No pages yet.');return;}
+  setStatus('Enhancing all pages…');
+  let i=0;
+  const d=batchDefaults();
+  const step=()=>{
+    if(i>=pages.length){renderPages();loadEditor();setStatus('All pages enhanced ('+batchFilter.toUpperCase()+').');return;}
+    const pg=pages[i++];
+    setStatus('Enhancing page '+i+' of '+pages.length+'…');
+    const img=new Image();
+    img.onload=()=>{ try{pg.current=renderFromOrig(img,pg.quad,batchFilter,d.b,d.c);pg.auto=true;}catch(e){} step(); };
+    img.onerror=()=>step();
+    img.src=pg.orig;
+  };
+  step();
+};
+$('batchRedetect').onclick=()=>{
+  if(!pages.length){alert('No pages yet.');return;}
+  setStatus('Re-detecting all pages…');
+  let i=0;
+  const d=batchDefaults();
+  const step=()=>{
+    if(i>=pages.length){renderPages();loadEditor();setStatus('Re-detect done.');return;}
+    const pg=pages[i++];
+    setStatus('Detecting page '+i+' of '+pages.length+'…');
+    const img=new Image();
+    img.onload=()=>{
+      const q=detectQuad(img);
+      try{
+        if(q){pg.quad=q;pg.current=renderFromOrig(img,q,batchFilter,d.b,d.c);pg.auto=true;}
+        else {pg.current=renderFromOrig(img,null,batchFilter,d.b,d.c);}
+      }catch(e){}
+      step();
+    };
+    img.onerror=()=>step();
+    img.src=pg.orig;
+  };
+  step();
+};
 /* ---------- editor ---------- */
 function loadEditor(){
   if(activeIdx<0||!pages[activeIdx]){srcImg=null;drawEmpty();return;}
   rotation=0;bright=0;contrast=0;$('bright').value=0;$('contrast').value=0;$('bVal').textContent='0';$('cVal').textContent='0';
-  filter='color';document.querySelectorAll('#filterSeg button').forEach(b=>b.classList.toggle('on',b.dataset.f==='color'));
+  filter='doc';document.querySelectorAll('#filterSeg button').forEach(b=>b.classList.toggle('on',b.dataset.f==='doc'));
   const img=new Image();
   img.onload=()=>{srcImg=img;
     const saved=pages[activeIdx].quad;
@@ -652,11 +784,75 @@ function warp(srcCanvas,quad,outW,outH){
   octx.putImageData(dst,0,0);
   return out;
 }
+/* Doc cleanup: whiten background (shadow removal), stretch contrast — CamScanner-style */
+function docCleanup(W,H,p){
+  const N=W*H;
+  const g=new Float32Array(N);
+  for(let i=0;i<N;i++){const o=i*4;g[i]=.299*p[o]+.587*p[o+1]+.114*p[o+2];}
+  // background estimate = local white on a coarse grid (ignores dark ink)
+  const gw=40, gh=Math.max(10,Math.round(40*H/W));
+  const bg=new Float32Array(gw*gh);
+  for(let y=0;y<gh;y++)for(let xx=0;xx<gw;xx++){
+    const x0=(xx*W/gw)|0,x1=Math.max(x0+1,(((xx+1)*W/gw)|0)),y0=(y*H/gh)|0,y1=Math.max(y0+1,(((y+1)*H/gh)|0));
+    let mx=0;
+    for(let yy=y0;yy<y1;yy+=2)for(let X=x0;X<x1;X+=2){const v=g[yy*W+X];if(v>mx)mx=v;}
+    bg[y*gw+xx]=mx||255;
+  }
+  // spread paper-white into ink-filled cells so text never counts as background
+  for(let pass=0;pass<2;pass++){
+    const s=bg.slice();
+    for(let y=0;y<gh;y++)for(let xx=0;xx<gw;xx++){
+      let mx=0;
+      for(let ky=-2;ky<=2;ky++)for(let kx=-2;kx<=2;kx++){
+        const yy=y+ky,X=xx+kx;
+        if(yy>=0&&yy<gh&&X>=0&&X<gw){const v=s[yy*gw+X];if(v>mx)mx=v;}
+      }
+      bg[y*gw+xx]=mx;
+    }
+  }
+  for(let pass=0;pass<2;pass++){
+    const s=bg.slice();
+    for(let y=0;y<gh;y++)for(let xx=0;xx<gw;xx++){
+      let t=0,n=0;
+      for(let ky=-1;ky<=1;ky++)for(let kx=-1;kx<=1;kx++){
+        const yy=y+ky,X=xx+kx;
+        if(yy>=0&&yy<gh&&X>=0&&X<gw){t+=s[yy*gw+X];n++;}
+      }
+      bg[y*gw+xx]=t/n;
+    }
+  }
+  // flatten light + autocontrast
+  const flat=new Float32Array(N);
+  for(let y=0;y<H;y++){
+    const gy=Math.min(gh-2,Math.max(0,(y*gh/H)|0)), fy=y*gh/H-gy;
+    for(let X=0;X<W;X++){
+      const gx=Math.min(gw-2,Math.max(0,(X*gw/W)|0)), fx=X*gw/W-gx;
+      const b=bg[gy*gw+gx]*(1-fx)*(1-fy)+bg[gy*gw+gx+1]*fx*(1-fy)+bg[(gy+1)*gw+gx]*(1-fx)*fy+bg[(gy+1)*gw+gx+1]*fx*fy;
+      const v=g[y*W+X];
+      flat[y*W+X]=Math.min(255,v+(255-v)*Math.max(0,(235-b)/235)*0.95);
+    }
+  }
+  const hist=new Uint32Array(256);
+  for(let i=0;i<N;i+=7)hist[Math.max(0,Math.min(255,flat[i]|0))]++;
+  const tot=Math.ceil(N/7);
+  let lo=0,hi=255,acc=0;
+  for(let v=0;v<256;v++){acc+=hist[v];if(acc>tot*0.01){lo=v;break;}}
+  acc=0;
+  for(let v=255;v>=0;v--){acc+=hist[v];if(acc>tot*0.005){hi=v;break;}}
+  if(hi-lo<20){hi=lo+20;}
+  const span=hi-lo;
+  for(let i=0;i<N;i++){
+    let v=(flat[i]-lo)*255/span;
+    v=v<0?0:(v>255?255:v);
+    const o=i*4;p[o]=p[o+1]=p[o+2]=v;
+  }
+}
 function enhance(canvas){
   const c=document.createElement('canvas');c.width=canvas.width;c.height=canvas.height;
   const x=c.getContext('2d',{willReadFrequently:true});
   x.drawImage(canvas,0,0);
   const id=x.getImageData(0,0,c.width,c.height),p=id.data;
+  if(filter==='doc')docCleanup(c.width,c.height,p);
   const bF=bright/100, cF=(100+contrast)/100;
   for(let i=0;i<p.length;i+=4){
     let r=p[i],g=p[i+1],bl=p[i+2];
@@ -667,7 +863,7 @@ function enhance(canvas){
     p[i]=Math.max(0,Math.min(255,r));p[i+1]=Math.max(0,Math.min(255,g));p[i+2]=Math.max(0,Math.min(255,bl));
   }
   x.putImageData(id,0,0);
-  if(filter==='sharp'){
+  if(filter==='sharp'||filter==='doc'){
     // 3x3 sharpen kernel on luminance-safe copy
     const src=x.getImageData(0,0,c.width,c.height),dst=x.createImageData(c.width,c.height);
     const s=src.data,dd2=dst.data,W=c.width,H=c.height;
@@ -720,19 +916,36 @@ function jpegDims(dataUrl){
   while(i<bytes.length){
     if(bytes[i]!==0xFF)break;
     const m=bytes[i+1];
-    if(m===0xC0||m===0xC2){return {w:bytes[i+5]*256+bytes[i+6],h:bytes[i+7]*256+bytes[i+8]};}
+    if(m===0xC0||m===0xC2){return {w:bytes[i+7]*256+bytes[i+8],h:bytes[i+5]*256+bytes[i+6]};}
     const len=bytes[i+2]*256+bytes[i+3];
     i+=2+len;
   }
   return {w:1240,h:1754};
 }
-function buildPdf(dataUrls){
+function buildPdf(dataUrls,opts){
+  opts=opts||{};
+  const PAPERS={a4:[595,842],letter:[612,792]};
   const enc=s=>{const o=[];for(let k=0;k<s.length;k++)o.push(s.charCodeAt(k)&255);return new Uint8Array(o);};
   const parts=[];let offsets=[];let bufLen=0;
   const push=u=>{parts.push(u);bufLen+=u.length;};
   const imgBins=dataUrls.map(u=>{const b=atob(u.split(',')[1]);const o=new Uint8Array(b.length);for(let k=0;k<b.length;k++)o[k]=b.charCodeAt(k);return o;});
   const n=dataUrls.length;
   const xrefAt=()=>bufLen;
+  // per-page boxes: standard paper sizes, or original full-bleed
+  const boxes=dataUrls.map(u=>{
+    const {w,h}=jpegDims(u);
+    if(opts.paper&&PAPERS[opts.paper]){
+      let pw= PAPERS[opts.paper][0], ph=PAPERS[opts.paper][1];
+      const land=opts.orient==='landscape'||(opts.orient==='auto'&&w>h);
+      const port=opts.orient==='portrait';
+      if(land&&ph>pw){const t=pw;pw=ph;ph=t;}
+      if(port&&pw>ph){const t=pw;pw=ph;ph=t;}
+      const m=28, s=Math.min((pw-2*m)/w,(ph-2*m)/h);
+      return {pw,ph,dw:w*s,dh:h*s,dx:(pw-w*s)/2,dy:(ph-h*s)/2};
+    }
+    const s=72/150, pw=Math.round(w*s), ph=Math.round(h*s);
+    return {pw,ph,dw:pw,dh:ph,dx:0,dy:0};
+  });
   push(enc('%PDF-1.4\n'));
   const objNum=i=>i; // 1=catalog,2=pages, then 2 per page (page+img)
   offsets[1]=xrefAt();push(enc('1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n'));
@@ -741,16 +954,14 @@ function buildPdf(dataUrls){
   dataUrls.forEach((u,pi)=>{
     const pObj=3+pi*2,iObj=4+pi*2;
     const {w,h}=jpegDims(u);
-    const maxW=595,maxH=842;
-    const s=Math.min(maxW/w,maxH/h);
-    const dw=w*s,dh=h*s,dx=(maxW-dw)/2,dy=(maxH-dh)/2;
+    const {pw,ph,dw,dh,dx,dy}=boxes[pi];
     offsets[pObj]=xrefAt();
-    push(enc(pObj+' 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Resources<</XObject<</Im'+pi+' '+iObj+' 0 R>>>>/Contents '+(100+pi)+' 0 R>>endobj\n'));
+    push(enc(pObj+' 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 '+pw+' '+ph+']/Resources<</XObject<</Im'+pi+' '+iObj+' 0 R>>>>/Contents '+(100+pi)+' 0 R>>endobj\n'));
     const bin=imgBins[pi];
     offsets[iObj]=xrefAt();
     push(enc(iObj+' 0 obj<</Type/XObject/Subtype/Image/Width '+w+'/Height '+h+'/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/DCTDecode/Length '+bin.length+'>>stream\n'));
     push(bin);push(enc('\nendstream\nendobj\n'));
-    const content='q '+dw.toFixed(1)+' 0 0 '+dh.toFixed(1)+' '+dx.toFixed(1)+' '+dy.toFixed(1)+' cm /Im'+pi+' Do Q';
+    const content='1 g 0 0 '+pw+' '+ph+' re f q '+dw.toFixed(1)+' 0 0 '+dh.toFixed(1)+' '+dx.toFixed(1)+' '+dy.toFixed(1)+' cm /Im'+pi+' Do Q';
     offsets[100+pi]=xrefAt();
     push(enc((100+pi)+' 0 obj<</Length '+content.length+'>>stream\n'+content+'\nendstream\nendobj\n'));
   });
@@ -767,8 +978,10 @@ function download(blob,name){const a=document.createElement('a');a.href=URL.crea
 $('expPdf').onclick=$('footPdf').onclick=()=>{
   if(!pages.length){alert('No pages to export.');return;}
   try{
-    const pdf=buildPdf(pages.map(p=>p.current));
-    download(new Blob([pdf],{type:'application/pdf'}),'scan.pdf');
+    const name=(($('fileName')&&$('fileName').value)||'scan').replace(/[^\w\- ]+/g,'').trim()||'scan';
+    const pdf=buildPdf(pages.map(p=>p.current),{paper:paper,orient:orient});
+    download(new Blob([pdf],{type:'application/pdf'}),name+'.pdf');
+    setStatus('Saved '+name+'.pdf ('+pages.length+' pages, '+(paper==='orig'?'original size':paper.toUpperCase())+').');
   }catch(e){alert('PDF failed: '+e.message);}
 };
 $('expJpg').onclick=()=>{
@@ -776,7 +989,8 @@ $('expJpg').onclick=()=>{
   const u=pages[activeIdx].current;
   const b=atob(u.split(',')[1]);const o=new Uint8Array(b.length);
   for(let k=0;k<b.length;k++)o[k]=b.charCodeAt(k);
-  download(new Blob([o],{type:'image/jpeg'}),'page-'+(activeIdx+1)+'.jpg');
+  const name=(($('fileName')&&$('fileName').value)||'scan').replace(/[^\w\- ]+/g,'').trim()||'scan';
+  download(new Blob([o],{type:'image/jpeg'}),name+'-p'+(activeIdx+1)+'.jpg');
 };
 
 renderPages();drawEmpty();
