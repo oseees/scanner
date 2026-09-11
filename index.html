@@ -204,6 +204,7 @@ $('rapidBtn').onclick=()=>{
 const overlay=$('overlay'), octx=overlay.getContext('2d');
 const liveBuf=document.createElement('canvas');
 let livePrev=null, liveStable=0, lastShutter=0, liveRunning=false, liveMax=0, capturing=false;
+let liveLock=null, liveLost=0, liveChal=null, liveChalN=0;
 function liveStatus(t){$('liveStatus').textContent=t||'';}
 function sharpnessOf(cnv){
   const w=160,h=Math.max(1,Math.round(160*cnv.height/cnv.width));
@@ -226,12 +227,13 @@ function liveDetect(srcCnv){
   const px=tc.getImageData(0,0,W,H).data;
   const g=new Float32Array(W*H);
   for(let i=0;i<W*H;i++)g[i]=px[i*4]*.299+px[i*4+1]*.587+px[i*4+2]*.114;
+  const cg=grayClose(g,W,H,3); // erase text so the outline sticks to the page
   const b=new Float32Array(W*H);
   for(let y=0;y<H;y++)for(let x=0;x<W;x++){
     let s=0,n=0;
     for(let ky=-1;ky<=1;ky++)for(let kx=-1;kx<=1;kx++){
       const yy=y+ky,xx=x+kx;
-      if(yy>=0&&yy<H&&xx>=0&&xx<W){s+=g[yy*W+xx];n++;}
+      if(yy>=0&&yy<H&&xx>=0&&xx<W){s+=cg[yy*W+xx];n++;}
     }
     b[y*W+x]=s/n;
   }
@@ -253,47 +255,78 @@ function liveDetect(srcCnv){
   if(polyArea(q)<W*H*0.1||maxCosine(q)>0.42)return null;
   return {q,W,H};
 }
-function drawOverlay(q,vw,vh){
+function drawOverlay(q,vw,vh,ghost){
   const r=$('vfWrap').getBoundingClientRect();
   const ew=Math.max(50,r.width), eh=Math.max(50,r.height);
   overlay.width=Math.round(ew);overlay.height=Math.round(eh);
   octx.clearRect(0,0,ew,eh);
   if(!q)return;
   const s=Math.min(ew/vw,eh/vh), ox=(ew-vw*s)/2, oy=(eh-vh*s)/2;
-  octx.strokeStyle='#30d158';octx.lineWidth=3;
+  octx.strokeStyle=ghost?'#ff9f0a':'#30d158';octx.lineWidth=3;
+  octx.setLineDash(ghost?[8,6]:[]);
   octx.beginPath();
   q.forEach((p,i)=>{const X=ox+p.x*s,Y=oy+p.y*s;i?octx.lineTo(X,Y):octx.moveTo(X,Y);});
   octx.closePath();octx.stroke();
-  octx.fillStyle='#30d158';
+  octx.setLineDash([]);
+  octx.fillStyle=ghost?'#ff9f0a':'#30d158';
   q.forEach(p=>{octx.beginPath();octx.arc(ox+p.x*s,oy+p.y*s,5,0,7);octx.fill();});
 }
+function quadDist(a,b){return a.reduce((s,p,i)=>s+Math.hypot(p.x-b[i].x,p.y-b[i].y),0)/4;}
+function smoothQuad(nu,old){return nu.map((p,i)=>({x:p.x*0.7+old[i].x*0.3,y:p.y*0.7+old[i].y*0.3}));}
 function liveTick(){
-  if(!stream){liveRunning=false;liveStatus('');return;}
+  if(!stream){liveRunning=false;liveLock=null;livePrev=null;liveStatus('');return;}
   try{
     const vw=video.videoWidth,vh=video.videoHeight;
     if(vw){
       liveBuf.width=320;liveBuf.height=Math.max(80,Math.round(320*vh/vw));
       liveBuf.getContext('2d').drawImage(video,0,0,liveBuf.width,liveBuf.height);
       const det=liveDetect(liveBuf);
-      let smooth=null;
+      const diag=Math.hypot(vw,vh);
+      let show=null, ghost=false, locked=false;
       if(det){
-        const sx=vw/det.W, sy=vh/det.H;
-        let q=det.q.map(p=>({x:p.x*sx,y:p.y*sy}));
-        if(livePrev){
-          const o1=orderPts(q), o0=livePrev;
-          const mv=o1.reduce((a,p,i)=>a+Math.hypot(p.x-o0[i].x,p.y-o0[i].y),0)/4;
-          liveStable=mv<vw*0.02?liveStable+1:0;
-          q=o1.map((p,i)=>({x:p.x*0.65+o0[i].x*0.35,y:p.y*0.65+o0[i].y*0.35}));
-        } else liveStable=0;
-        livePrev=q;smooth=q;
-      } else {liveStable=0;livePrev=null;}
-      drawOverlay(smooth,vw,vh);
+        const q=orderPts(det.q.map(p=>({x:p.x*vw/det.W,y:p.y*vh/det.H})));
+        const area=polyArea(q)/(vw*vh);
+        if(!liveLock){
+          // acquire: same quad twice in a row before trusting it
+          if(area>0.12&&area<0.92){
+            if(liveChal&&quadDist(q,liveChal)<diag*0.06)liveChalN++;
+            else{liveChal=q.map(p=>({x:p.x,y:p.y}));liveChalN=1;}
+            if(liveChalN>=2){liveLock={q:liveChal,area};livePrev=liveChal.map(p=>({x:p.x,y:p.y}));liveStable=0;liveLost=0;liveChal=null;}
+            show=q;
+          } else {liveChal=null;liveChalN=0;}
+        } else if(area>0.08&&area<0.95&&quadDist(q,liveLock.q)<diag*0.10&&Math.abs(area-liveLock.area)/(liveLock.area+1e-6)<0.7){
+          // tracking: update corner-by-corner, reject jumping corners
+          const upd=liveLock.q.map((p,i)=>{
+            const dd=Math.hypot(q[i].x-p.x,q[i].y-p.y);
+            return dd<diag*0.08?q[i]:p;
+          });
+          liveLock.q=smoothQuad(upd,liveLock.q);
+          liveLock.area=area;liveLost=0;liveChal=null;liveChalN=0;
+          const mv=quadDist(liveLock.q,livePrev||liveLock.q);
+          livePrev=liveLock.q.map(p=>({x:p.x,y:p.y}));
+          liveStable=mv<vw*0.015?liveStable+1:0;
+          show=liveLock.q;locked=true;
+        } else {
+          // something else entered the frame: only switch after it proves stable
+          if(liveChal&&quadDist(q,liveChal)<diag*0.05)liveChalN++;
+          else{liveChal=q.map(p=>({x:p.x,y:p.y}));liveChalN=1;}
+          if(liveChalN>=6){liveLock={q:liveChal,area};livePrev=liveChal.map(p=>({x:p.x,y:p.y}));liveStable=0;liveChal=null;}
+          show=liveLock.q;ghost=true;liveStable=0;locked=true;
+        }
+      } else {
+        liveChal=null;liveChalN=0;
+        if(liveLock&&liveLost<10){liveLost++;show=liveLock.q;ghost=true;liveStable=0;locked=true;}
+        else{liveLock=null;livePrev=null;liveStable=0;}
+      }
+      drawOverlay(show,vw,vh,ghost);
       const sharp=sharpnessOf(liveBuf);
       liveMax=Math.max(sharp,liveMax*0.985);
       const focused=liveMax>40&&sharp>liveMax*0.55;
-      if(!smooth)liveStatus('Point at the document…');
-      else if(liveStable<4)liveStatus('Hold steady…');
-      else if(!focused)liveStatus('Hold still — focusing…');
+      if(!show)liveStatus('Point at the document…');
+      else if(!locked)liveStatus('Framing…');
+      else if(ghost)liveStatus('Keep the page in view…');
+      else if(liveStable<6)liveStatus('Locked — hold steady…');
+      else if(!focused)liveStatus('Locked — hold still, focusing…');
       else{
         liveStatus('Sharp — capturing…');
         if($('autoShutter')&&$('autoShutter').checked&&!capturing&&Date.now()-lastShutter>3500){
@@ -305,7 +338,7 @@ function liveTick(){
   }catch(e){}
   setTimeout(liveTick,180);
 }
-function startLive(){ if(!liveRunning){liveRunning=true;liveStable=0;livePrev=null;liveMax=0;lastShutter=0;liveTick();} }
+function startLive(){ if(!liveRunning){liveRunning=true;liveStable=0;livePrev=null;liveMax=0;liveLock=null;liveLost=0;liveChal=null;liveChalN=0;lastShutter=0;liveTick();} }
 async function captureFrame(){
   const v=video, w=v.videoWidth, h=v.videoHeight;
   if(!w){ alert('Start the camera first, or import a photo.'); return; }
